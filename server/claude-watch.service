@@ -1,0 +1,20 @@
+# Runs the server automatically when the Pi boots.
+# Install (edit User and paths first if your username isn't "pi"):
+#   sudo cp claude-watch.service /etc/systemd/system/
+#   sudo systemctl enable --now claude-watch
+#   journalctl -u claude-watch -f     # watch the logs
+
+[Unit]
+Description=Claude Watch server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=pi
+WorkingDirectory=/home/pi/claude-watch/server
+EnvironmentFile=/home/pi/claude-watch/server/.env
+ExecStart=/usr/bin/python3 /home/pi/claude-watch/server/server.py
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

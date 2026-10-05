@@ -3,4 +3,6 @@
 !.env.example
 .venv/
 __pycache__/
-tools/notes.txt
+data/
+tools/credentials.json
+tools/token.json

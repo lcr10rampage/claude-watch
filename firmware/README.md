@@ -1,5 +1,13 @@
 # Watch firmware
 
-Coming once the watch model is chosen (LilyGo T-Watch S3 or Waveshare ESP32-S3).
-It will: connect to Wi-Fi, show a watch face (LVGL), and on button press send
-`POST /ask` with header `X-Watch-Token` to the server, then display the answer.
+For the Waveshare ESP32-S3-Touch-AMOLED-2.06. Coming once the watch arrives.
+
+Plan:
+- Wi-Fi + watch face (LVGL)
+- Talk button: record audio → transcribe → `POST /ask` → show the answer
+- Brief button: `GET /brief`
+- Every minute: `GET /reminders/due` → vibrate/beep and show any reminders
+- Bluetooth ANCS: show iPhone notifications directly from the phone
+- On-watch extras: step counter (IMU), timers, alarms
+
+All server requests send the `X-Watch-Token` header.

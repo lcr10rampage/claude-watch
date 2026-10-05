@@ -1,52 +1,77 @@
 # Claude Watch
 
-A homemade smartwatch powered by Claude. The watch is just a screen, mic, and
-button; the thinking happens on a Raspberry Pi running Claude Code.
+A homemade smartwatch powered by Claude. The watch (Waveshare ESP32-S3
+Touch AMOLED 2.06) is just a screen, mic, and buttons; the thinking happens
+on a Raspberry Pi running Claude Code.
 
 ```
-Watch ──Wi-Fi──▶ server/server.py (Pi) ──▶ claude -p ──▶ Google Calendar
-                                                     └──▶ tools/watch_tools.py (your APIs)
+Watch ──Wi-Fi──▶ server/server.py (Pi) ──▶ claude -p ──▶ tools/watch_tools.py
+                                                          ├─ Gmail (read-only)
+                                                          ├─ Google Calendar
+                                                          ├─ Google Sheets (budget)
+                                                          ├─ Reminders
+                                                          └─ Weather, notes
 ```
 
 ## Folders
 
-| Folder      | What it is                                                    |
-|-------------|---------------------------------------------------------------|
-| `server/`   | Receives questions from the watch, asks Claude, returns answers |
+| Folder      | What it is                                                     |
+|-------------|----------------------------------------------------------------|
+| `server/`   | Receives requests from the watch, asks Claude, returns answers |
 | `brain/`    | `CLAUDE.md`: how the watch's Claude behaves (edit freely)       |
-| `tools/`    | Your custom APIs, one Python function each                     |
-| `firmware/` | Watch code (coming once the watch is picked)                   |
+| `tools/`    | Your APIs, one Python function each                             |
+| `data/`     | Reminders and notes (created automatically, not in git)         |
+| `firmware/` | Watch code (coming once the watch arrives)                      |
+
+## What you can ask
+
+- "What's on my calendar today?" / "Add dentist Tuesday at 3:30"
+- "Any important emails?"
+- "Spent 12 on lunch" / "How much have I spent on food this month?"
+- "Remind me at 5 to email the client" (the watch buzzes)
+- Tap **Brief** for weather + calendar + important email
 
 ## Setup on the Pi
 
 1. **Get the code**
    ```bash
-   cd ~ && git clone https://github.com/<you>/claude-watch.git
+   cd ~ && git clone https://github.com/lcr10rampage/claude-watch.git
    cd claude-watch
    ```
 
-2. **Make sure Claude Code works** (logged in with your subscription)
-   ```bash
-   claude -p "say hi"
-   ```
-
-3. **Connect Google Calendar** to Claude Code. Add a Google Calendar MCP
-   server named `google-calendar` with `claude mcp add` (ask Claude Code to
-   help you set one up), then test:
-   ```bash
-   cd brain && claude -p "What's on my calendar today?"
-   ```
-
-4. **Set up your custom tools**
+2. **Install the tools**
    ```bash
    cd ~/claude-watch/tools
    python3 -m venv .venv
    .venv/bin/pip install -r requirements.txt
    cp .env.example .env
+   ```
+
+3. **Connect Google (Gmail, Calendar, Sheets)**
+   1. Go to [console.cloud.google.com](https://console.cloud.google.com), pick
+      or create a project.
+   2. **APIs & Services → Library**: enable **Gmail API**, **Google Calendar
+      API**, and **Google Sheets API**.
+   3. **APIs & Services → OAuth consent screen**: choose External, fill in
+      the app name and your email, and add yourself under **Test users**.
+   4. **Credentials → Create credentials → OAuth client ID → Desktop app**.
+      Download the JSON and save it as `~/claude-watch/tools/credentials.json`.
+   5. Log in once (a browser opens on the Pi):
+      ```bash
+      cd ~/claude-watch/tools && .venv/bin/python google_auth.py
+      ```
+
+4. **Point it at your budget sheet.** Open `tools/.env` and set
+   `SHEET_BUDGET` to the ID from your sheet's URL
+   (`docs.google.com/spreadsheets/d/<ID>/edit`) and `SHEET_BUDGET_TAB` to
+   the tab where expenses go.
+
+5. **Register the tools with Claude Code**
+   ```bash
    claude mcp add --scope user watch-tools -- ~/claude-watch/tools/.venv/bin/python ~/claude-watch/tools/watch_tools.py
    ```
 
-5. **Configure the server**
+6. **Configure the server**
    ```bash
    cd ~/claude-watch/server
    cp .env.example .env
@@ -54,33 +79,36 @@ Watch ──Wi-Fi──▶ server/server.py (Pi) ──▶ claude -p ──▶ G
    nano .env
    ```
 
-6. **Run it and test**
+7. **Run it and test**
    ```bash
    set -a; source .env; set +a
    python3 server.py
-   # in a second terminal:
-   python3 ask.py --token <your token> "What's the weather?"
+   # in a second terminal (use your token):
+   python3 ask.py --token <token> "What's on my calendar today?"
+   python3 ask.py --token <token> "Spent 5 on coffee"
+   python3 ask.py --token <token> --brief
    ```
 
-7. **Start it on boot** (optional): see the comments in
-   `server/claude-watch.service`.
+8. **Start it on boot** (optional): see the comments in
+   `server/claude-watch.service`. Change `pi` to your username if it's different.
 
 ## Adding a new API
 
 1. Add a function to `tools/watch_tools.py` (copy the template at the bottom).
 2. Put any API key in `tools/.env`.
-3. Add a line about it to `brain/CLAUDE.md` so Claude knows it exists.
-4. If it's a separate MCP server (not in `watch_tools.py`), add it with
-   `claude mcp add` and append its name to `CLAUDE_ALLOWED_TOOLS` in
-   `server/.env`.
+3. Add a line about it to `brain/CLAUDE.md` so Claude knows when to use it.
 
-## Talking to the server (for the watch firmware)
+## Server endpoints (for the watch firmware)
 
-```
-POST /ask
-Headers: Content-Type: application/json, X-Watch-Token: <token>
-Body:    {"question": "What's next on my calendar?"}
-Reply:   {"answer": "Dentist at 3:30 PM today."}
-```
+All except `/health` need the header `X-Watch-Token: <token>`.
 
-`GET /health` returns `{"ok": true}`.
+| Request              | Does                                                    |
+|----------------------|---------------------------------------------------------|
+| `POST /ask`          | Body `{"question": "..."}` → `{"answer": "..."}`         |
+| `GET /brief`         | Morning brief → `{"answer": "..."}`                      |
+| `GET /reminders/due` | Reminders to buzz now (each returned once). Poll every minute. |
+| `GET /reminders`     | All upcoming reminders                                  |
+| `GET /health`        | `{"ok": true}`                                          |
+
+iPhone notifications don't go through the server: the watch gets them
+straight from the phone over Bluetooth (ANCS). That's part of the firmware.

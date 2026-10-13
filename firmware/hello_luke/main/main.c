@@ -337,6 +337,15 @@ static void screen_gesture_cb(lv_event_t *e)
 #define SLAP_JOLT_G            2.5f   /* |accel| deviation from 1 g for a "hit"  */
 #define SLAP_WINDOW_MS         300    /* touch and jolt must be this close       */
 #define IMU_BOOT_IGNORE_MS     1500   /* first IMU samples after boot are junk   */
+/* Palm path: on the wrist a slap usually lands as a whole palm, which makes the
+ * FT3168 stop answering I2C for ~4 s instead of reporting a contact. The onset of
+ * a *fresh* silent window is palm-specific, so it only needs a modest jolt. */
+#define PALM_JOLT_G            1.0f
+#define PALM_WINDOW_MS         400
+#define PALM_FRESH_GAP_MS      500    /* window must start this long after the previous one ended */
+static int64_t  s_last_palm_us = -1;
+static int64_t  s_last_jolt_lo_us = -1;
+static int64_t  s_nack_end_us = -1;
 
 static int64_t  s_last_jolt_us = -1;
 static float    s_jolt_peak_g = 0;
@@ -344,14 +353,24 @@ static float    s_jolt_peak_g = 0;
 static void slap_check(const char *source)
 {
     int64_t now = esp_timer_get_time();
-    if (s_last_touch_us < 0 || s_last_jolt_us < 0) return;
-    int64_t gap = s_last_touch_us - s_last_jolt_us;
-    if (gap < 0) gap = -gap;
-    if (gap > SLAP_WINDOW_MS * 1000LL) return;
     if (s_last_slap_us >= 0 && now - s_last_slap_us < SLAP_LOCKOUT_MS * 1000LL) return;
 
+    const char *path = NULL;
+    int64_t gap = 0;
+    if (s_last_touch_us >= 0 && s_last_jolt_us >= 0) {
+        gap = s_last_touch_us - s_last_jolt_us;
+        if (gap < 0) gap = -gap;
+        if (gap <= SLAP_WINDOW_MS * 1000LL) path = "touch+jolt";
+    }
+    if (!path && s_last_palm_us >= 0 && s_last_jolt_lo_us >= 0) {
+        gap = s_last_palm_us - s_last_jolt_lo_us;
+        if (gap < 0) gap = -gap;
+        if (gap <= PALM_WINDOW_MS * 1000LL) path = "palm+jolt";
+    }
+    if (!path) return;
+
     s_last_slap_us = now;
-    ESP_LOGI(TAG, "SLAP detected (%s, gap %lld ms, jolt %.2f g)", source, gap / 1000, s_jolt_peak_g);
+    ESP_LOGI(TAG, "SLAP detected (%s via %s, gap %lld ms, jolt %.2f g)", source, path, gap / 1000, s_jolt_peak_g);
     if (bsp_display_lock(100)) {
         screen_set(!s_screen_on);
         bsp_display_unlock();
@@ -400,12 +419,18 @@ static void touch_poll_task(void *arg)
         if (rd != ESP_OK) {
             if (errors++ == 0) {
                 err_start_us = esp_timer_get_time();
-                ESP_LOGW(TAG, "TPERR start: %s", esp_err_to_name(rd));
+                bool fresh = (s_nack_end_us < 0) || (err_start_us - s_nack_end_us > PALM_FRESH_GAP_MS * 1000LL);
+                ESP_LOGW(TAG, "TPERR start: %s%s", esp_err_to_name(rd), fresh ? " (palm)" : " (continuing)");
+                if (fresh) {
+                    s_last_palm_us = err_start_us;
+                    slap_check("palm");
+                }
             }
             continue;
         }
         if (errors > 0) {
-            ESP_LOGW(TAG, "TPERR end: %d failures over %lld ms", errors, (esp_timer_get_time() - err_start_us) / 1000);
+            s_nack_end_us = esp_timer_get_time();
+            ESP_LOGW(TAG, "TPERR end: %d failures over %lld ms", errors, (s_nack_end_us - err_start_us) / 1000);
         }
         /* The FT3168 returns one constant byte across the whole frame while a palm
          * covers the glass (palm rejection). Log it; do not treat it as a bus fault. */
@@ -509,8 +534,9 @@ static void imu_task(void *arg)
         if (esp_timer_get_time() < IMU_BOOT_IGNORE_MS * 1000LL) continue;
         if (dev_g > window_peak) window_peak = dev_g;
 
-        if (dev_g >= SLAP_JOLT_G) {
-            s_last_jolt_us = esp_timer_get_time();
+        if (dev_g >= PALM_JOLT_G) {
+            s_last_jolt_lo_us = esp_timer_get_time();
+            if (dev_g >= SLAP_JOLT_G) s_last_jolt_us = s_last_jolt_lo_us;
             s_jolt_peak_g = dev_g;
             slap_check("imu");
         }

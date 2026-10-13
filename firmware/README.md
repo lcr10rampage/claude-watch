@@ -14,9 +14,13 @@ What it does today:
 - **Drag right-to-left on Home** → **Stopwatch**: full-screen black sheet with
   Start/Stop and Reset. Drag left-to-right to close. Swipe down on Home → Clock.
 - **Palm slap** anywhere → screen off and a silent reset to the Clock face;
-  slap again → screen on. Detection = any touch contact + a ≥2.5 g jolt from
-  the QMI8658 accelerometer within 300 ms (fingertip taps stay under ~1 g,
-  a table bump has no touch).
+  slap again → screen on. Two detection paths, either one fires:
+  1. a touch contact + a ≥2.5 g jolt from the QMI8658 accelerometer within
+     300 ms (fingertip taps stay under ~1 g, a table bump has no touch);
+  2. on the wrist a palm usually gets *rejected* by the FT3168 (it stops
+     answering I2C for ~4 s) instead of reporting a contact, so the onset of a
+     fresh silent window + a ≥1 g jolt within 400 ms also counts. Chained
+     windows (palm left resting) don't re-trigger.
 - Tap is reserved for UI actions (stopwatch buttons today).
 
 ### Build & flash (on the Pi)

@@ -18,6 +18,8 @@
 #include "esp_check.h"
 #include "driver/i2c_master.h"
 #include "driver/gpio.h"
+#include "esp_system.h"
+#include "esp_attr.h"
 #include "driver/usb_serial_jtag.h"
 #include "esp_timer.h"
 #include "esp_random.h"
@@ -34,6 +36,37 @@ static void face_toggle(void);
 static void face_reset_instant(void);
 static void screen_set(bool on);
 static bool s_screen_on = true;
+
+/* ---------------------------------------------------------------------- */
+/* Event log: last EVLOG_N touch/controller/screen events, kept in noinit   */
+/* RAM so it survives a software reset. Dump over serial with "DUMP".       */
+/* ---------------------------------------------------------------------- */
+#define EVLOG_N      512
+#define EVLOG_MAGIC  0x4C554B45u   /* "LUKE" */
+typedef struct { uint32_t t_ms; char kind; int16_t a; int16_t b; } evlog_entry_t;
+static __NOINIT_ATTR uint32_t      s_evlog_magic;
+static __NOINIT_ATTR uint32_t      s_evlog_head;     /* next write index, grows forever */
+static __NOINIT_ATTR evlog_entry_t s_evlog[EVLOG_N];
+static portMUX_TYPE s_evlog_mux = portMUX_INITIALIZER_UNLOCKED;
+
+static void evlog_add(char kind, int a, int b)
+{
+    portENTER_CRITICAL(&s_evlog_mux);
+    evlog_entry_t *e = &s_evlog[s_evlog_head % EVLOG_N];
+    e->t_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    e->kind = kind; e->a = (int16_t)a; e->b = (int16_t)b;
+    s_evlog_head++;
+    portEXIT_CRITICAL(&s_evlog_mux);
+}
+
+static void evlog_init(void)
+{
+    if (s_evlog_magic != EVLOG_MAGIC || s_evlog_head > 0x7FFFFFFF) {
+        s_evlog_magic = EVLOG_MAGIC;
+        s_evlog_head = 0;
+    }
+    evlog_add('B', (int)esp_reset_reason(), 0);   /* boot marker + why we reset */
+}
 /* Touch-derived actions (cover, wake, taps, swipes) are ignored until this time.
  * Set after a screen toggle, and briefly after a palm-rejection window ends,
  * because the controller emits a ghost press as it comes back. */
@@ -197,6 +230,19 @@ static void console_handle_line(char *line)
     } else if (strncmp(line, "TIMETAP", 7) == 0) {
         if (bsp_display_lock(100)) { if (s_face != FACE_STOPWATCH) face_toggle(); bsp_display_unlock(); }
         console_reply("OK timetap\n");
+    } else if (strncmp(line, "DUMP", 4) == 0) {
+        uint32_t head = s_evlog_head;
+        uint32_t n = head < EVLOG_N ? head : EVLOG_N;
+        char out[64];
+        snprintf(out, sizeof(out), "EVLOG %lu events (uptime %lld s)\n", (unsigned long)n, esp_timer_get_time() / 1000000);
+        console_reply(out);
+        for (uint32_t i = head - n; i < head; i++) {
+            const evlog_entry_t *e = &s_evlog[i % EVLOG_N];
+            snprintf(out, sizeof(out), "%8lu.%03lu %c %d %d\n", (unsigned long)(e->t_ms / 1000), (unsigned long)(e->t_ms % 1000), e->kind, e->a, e->b);
+            console_reply(out);
+            vTaskDelay(1);
+        }
+        console_reply("END\n");
     } else if (strncmp(line, "DTAP", 4) == 0) {
         if (bsp_display_lock(100)) { screen_set(!s_screen_on); bsp_display_unlock(); }
         console_reply("OK dtap\n");
@@ -266,6 +312,7 @@ static void screen_set(bool on)
         face_reset_instant();      /* next wake always starts on the photo face */
     }
     ESP_LOGI(TAG, "Screen %s", on ? "on" : "off");
+    evlog_add('S', on ? 1 : 0, 0);
 }
 
 static void screen_press_cb(lv_event_t *e)
@@ -281,6 +328,7 @@ static void screen_tap_cb(lv_event_t *e)
     lv_point_t pt;
     lv_indev_get_point(lv_indev_active(), &pt);
     ESP_LOGI(TAG, "Tap at (%d, %d)", (int)pt.x, (int)pt.y);
+    evlog_add('T', pt.x, pt.y);
     corner_tap(pt.x, pt.y);
 }
 
@@ -317,7 +365,7 @@ static void screen_gesture_cb(lv_event_t *e)
 }
 
 /* ---------------------------------------------------------------------- */
-/* Screen on/off: double-tap the top-right corner of the glass.            */
+/* Screen on/off: double-tap the bottom-right corner of the glass.         */
 /* ---------------------------------------------------------------------- */
 #define FT3168_ADDR            0x38
 #define FT_REG_TD_STATUS       0x02
@@ -325,14 +373,45 @@ static void screen_gesture_cb(lv_event_t *e)
 #define SCREEN_W               410
 #define SCREEN_H               502
 #define IMU_BOOT_IGNORE_MS     1500   /* first IMU samples after boot are junk   */
-#define CORNER_X_MIN           (SCREEN_W * 60 / 100)   /* right 40 % of the width  */
-#define CORNER_Y_MAX           (SCREEN_H * 30 / 100)   /* top 30 % of the height   */
+#define TP_RST_GPIO            BSP_LCD_TOUCH_RST
+#define TP_WATCHDOG_MS         10000   /* controller silent this long -> reset it */
+static i2c_master_dev_handle_t s_tp_dev = NULL;
+
+/* Program the FT3168 the way we want it: driver thresholds, and auto-monitor
+ * mode OFF (0x86=0) so it never dozes and swallows the first tap of a double tap. */
+static void tp_configure(const char *why)
+{
+    if (!s_tp_dev) return;
+    const uint8_t init[][2] = { {0x80, 70}, {0x81, 60}, {0x82, 16}, {0x83, 60}, {0x84, 10}, {0x85, 20},
+                                {0x86, 0x00}, {0x87, 0xFF}, {0xA5, 0x00} };
+    for (size_t i = 0; i < sizeof(init) / sizeof(init[0]); i++) {
+        i2c_master_transmit(s_tp_dev, init[i], 2, 50);
+    }
+    uint8_t r = 0x86, ctrl[2] = {0xFF, 0xFF};
+    i2c_master_transmit_receive(s_tp_dev, &r, 1, ctrl, 2, 50);
+    ESP_LOGI(TAG, "FT3168 configured (%s): ctrl=%02x t_mon=%02x", why, ctrl[0], ctrl[1]);
+}
+
+/* Hardware reset of the touch controller (GPIO 9; verified harmless to the display). */
+static void tp_reset(const char *why)
+{
+    ESP_LOGW(TAG, "Touch controller reset (%s)", why);
+    evlog_add('R', 0, 0);
+    gpio_set_level(TP_RST_GPIO, 0);
+    vTaskDelay(pdMS_TO_TICKS(10));
+    gpio_set_level(TP_RST_GPIO, 1);
+    vTaskDelay(pdMS_TO_TICKS(150));
+    tp_configure("after reset");
+}
+
+#define CORNER_X_MIN           (SCREEN_W * 60 / 100)   /* right 40 % of the width   */
+#define CORNER_Y_MIN           (SCREEN_H * 70 / 100)   /* bottom 30 % of the height */
 #define DTAP_MAX_GAP_MS        500
 static int64_t s_corner_tap1_us = -1;
 
 static void corner_tap(int x, int y)
 {
-    if (x < CORNER_X_MIN || y > CORNER_Y_MAX) {
+    if (x < CORNER_X_MIN || y < CORNER_Y_MIN) {
         s_corner_tap1_us = -1;          /* a tap elsewhere breaks the sequence */
         return;
     }
@@ -340,7 +419,8 @@ static void corner_tap(int x, int y)
     if (s_corner_tap1_us >= 0 && now - s_corner_tap1_us <= DTAP_MAX_GAP_MS * 1000LL) {
         s_corner_tap1_us = -1;
         s_touch_quiet_until_us = now + TOUCH_QUIET_AFTER_TOGGLE_MS * 1000LL;
-        ESP_LOGI(TAG, "DOUBLE-TAP corner -> screen %s", s_screen_on ? "off" : "on");
+        ESP_LOGI(TAG, "DOUBLE-TAP bottom-right -> screen %s", s_screen_on ? "off" : "on");
+        evlog_add('D', s_screen_on ? 0 : 1, 0);
         screen_set(!s_screen_on);       /* called from the LVGL task: already locked */
     } else {
         s_corner_tap1_us = now;
@@ -374,6 +454,9 @@ static void touch_poll_task(void *arg)
         return;
     }
 
+    s_tp_dev = tp;
+    tp_configure("boot");
+
     uint8_t reg = 0x01;                         /* gesture, td_status, then 6 bytes per point */
     uint8_t buf[2 + 6 * FT_MAX_POINTS];
     bool was_touching = false;
@@ -390,6 +473,18 @@ static void touch_poll_task(void *arg)
             if (errors++ == 0) {
                 err_start_us = esp_timer_get_time();
                 ESP_LOGW(TAG, "TPERR start: %s", esp_err_to_name(rd));
+                evlog_add('E', (int)(rd & 0x7FFF), 0);
+            }
+            int64_t now = esp_timer_get_time();
+            if (now - err_start_us > TP_WATCHDOG_MS * 1000LL) {
+                evlog_add('e', (int)((now - err_start_us) / 1000), errors);
+                if (rd == ESP_ERR_TIMEOUT) {
+                    ESP_LOGW(TAG, "I2C timeouts: resetting bus");
+                    i2c_master_bus_reset(bsp_i2c_get_handle());
+                    vTaskDelay(pdMS_TO_TICKS(50));
+                }
+                tp_reset("watchdog");
+                errors = 0;
             }
             continue;
         }
@@ -398,6 +493,7 @@ static void touch_poll_task(void *arg)
             int64_t q = end_us + TOUCH_QUIET_AFTER_NACK_MS * 1000LL;
             if (q > s_touch_quiet_until_us) s_touch_quiet_until_us = q;
             ESP_LOGW(TAG, "TPERR end: %d failures over %lld ms", errors, (end_us - err_start_us) / 1000);
+            evlog_add('e', (int)((end_us - err_start_us) / 1000), errors);
         }
         /* The FT3168 returns one constant byte across the whole frame while a palm
          * covers the glass (palm rejection). Log it; do not treat it as a bus fault. */
@@ -439,6 +535,10 @@ static void touch_poll_task(void *arg)
 
         if (!was_touching) {
             contact_start_us = esp_timer_get_time();
+            {
+                const uint8_t *p0 = &buf[2];
+                evlog_add('C', ((p0[0] & 0x0F) << 8) | p0[1], ((p0[2] & 0x0F) << 8) | p0[3]);
+            }
             contact_polls = 0; contact_max_n = 0;
             contact_minx = 9999; contact_maxx = -1; contact_miny = 9999; contact_maxy = -1;
         }
@@ -983,6 +1083,7 @@ static void build_ui(void)
 
 void app_main(void)
 {
+    evlog_init();
     bsp_display_start();
     clock_setup();
 

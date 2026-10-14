@@ -12,10 +12,10 @@ What it does today:
   AM/PM, date. Tap the time again to go back.
 - **Drag right-to-left** on the photo face → **stopwatch** (full-screen black
   sheet, Start/Stop + Reset). Drag left-to-right to close it.
-- **Double-tap the top-right corner** (right 40 % × top 30 % of the glass, taps
-  ≤ 500 ms apart) → screen off; same again → screen on. Works on every face
-  and while the screen is dark. Waking always lands on the photo face with a
-  fresh picture.
+- **Double-tap the bottom-right corner** (right 40 % × bottom 30 % of the
+  glass, taps ≤ 500 ms apart) → screen off; same again → screen on. Works on
+  every face and while the screen is dark. Waking always lands on the photo
+  face with a fresh picture.
 - Time comes from the on-board PCF85063 RTC, seeded from the build timestamp
   on first boot and resyncable from the Pi with `./settime.sh`.
 
@@ -48,22 +48,26 @@ Stop any serial listener before flashing; the port cannot be shared.
 
 `SETTIME YYYY-MM-DD HH:MM:SS`, `GETTIME`, `TIMETAP` (photo ↔ clock face),
 `SWIPE LEFT|RIGHT` (stopwatch in/out), `DTAP` (toggle screen), `TAP`,
-`LOG ON|OFF` (verbose touch/accelerometer logging).
+`DUMP` (on-device event log), `LOG ON|OFF` (verbose touch/accelerometer logging).
 
 ### Helper scripts (`tools/`, run with the ESP-IDF venv's python for pyserial)
 
-- `cmd.py "SWIPE UP"` — send one console command and show the reply/log.
+- `cmd.py "DTAP"` — send one console command and show the reply/log.
+- `dump.py` — print the watch's event log: last 512 taps, contacts, touch I2C
+  errors, controller resets and screen on/off, kept in noinit RAM so it
+  survives a software reset. Run it after a bad day to see what happened.
 - `reset_and_log.py [secs]` — hard-reset the watch and print its boot log.
 - `listen.py` — stream the watch's log lines.
 - `make_pics.py` — photos → 410×502 RGB565 `.bin` files for the Home face.
 
 ### Hardware notes learned the hard way
 
-- FT3168 touch: reports a single point only, weight/area always 0. A palm puts
-  it into monitor mode: it stops acknowledging I2C for ≥4 s (longer if the hand
-  stays) and emits an all-0xFF frame on the way back (dropped). Register 0x86=1
-  enables auto-monitor, 0x87=0x0a is the idle timer in seconds; a hardware reset
-  (GPIO 9, safe for the display) restores those defaults.
+- FT3168 touch: reports a single point only, weight/area always 0. By default
+  it drops into monitor mode after ~10 s idle (and on a palm), where it stops
+  acknowledging I2C and swallows the first tap. The firmware writes 0x86=0 /
+  0x87=0xFF at boot and after any reset to keep it awake. A 10 s touch
+  watchdog pulses its reset line (GPIO 9, safe for the display) if it goes
+  silent anyway, resetting the I2C bus first if the failure was a timeout.
 - QMI8658 driver (`waveshare/qmi8658`) returns milli-g; the first sample after
   boot is junk.
 - Flash chip is 32 MB but the build is configured for 16 MB (fine for now).

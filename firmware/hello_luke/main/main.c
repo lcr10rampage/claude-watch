@@ -17,6 +17,7 @@
 #include "esp_err.h"
 #include "esp_check.h"
 #include "driver/i2c_master.h"
+#include "driver/gpio.h"
 #include "driver/usb_serial_jtag.h"
 #include "esp_timer.h"
 #include "esp_random.h"
@@ -33,6 +34,14 @@ static void face_toggle(void);
 static void face_reset_instant(void);
 static void screen_set(bool on);
 static bool s_screen_on = true;
+/* Touch-derived actions (cover, wake, taps, swipes) are ignored until this time.
+ * Set after a screen toggle, and briefly after a palm-rejection window ends,
+ * because the controller emits a ghost press as it comes back. */
+static int64_t s_touch_quiet_until_us = 0;
+#define TOUCH_QUIET_AFTER_TOGGLE_MS   1500
+#define TOUCH_QUIET_AFTER_NACK_MS     400
+static inline bool touch_quiet(void) { return esp_timer_get_time() < s_touch_quiet_until_us; }
+static void corner_tap(int x, int y);
 static bool s_raw_diff = false;   /* unused now; kept for the RAW serial command */
 static bool s_calib_log = false;  /* calibration logging, "LOG ON|OFF" over serial */
 
@@ -185,21 +194,18 @@ static void console_handle_line(char *line)
                  t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
                  t.tm_hour, t.tm_min, t.tm_sec);
         console_reply(out);
-    } else if (strncmp(line, "SWIPE UP", 8) == 0) {
-        if (bsp_display_lock(100)) { face_set(FACE_HOME); bsp_display_unlock(); }
-        console_reply("OK swipe up\n");
-    } else if (strncmp(line, "SWIPE DOWN", 10) == 0) {
-        if (bsp_display_lock(100)) { face_set(FACE_CLOCK); bsp_display_unlock(); }
-        console_reply("OK swipe down\n");
+    } else if (strncmp(line, "TIMETAP", 7) == 0) {
+        if (bsp_display_lock(100)) { if (s_face != FACE_STOPWATCH) face_toggle(); bsp_display_unlock(); }
+        console_reply("OK timetap\n");
+    } else if (strncmp(line, "DTAP", 4) == 0) {
+        if (bsp_display_lock(100)) { screen_set(!s_screen_on); bsp_display_unlock(); }
+        console_reply("OK dtap\n");
     } else if (strncmp(line, "SWIPE LEFT", 10) == 0) {
         if (bsp_display_lock(100)) { if (s_face == FACE_HOME) face_set(FACE_STOPWATCH); bsp_display_unlock(); }
         console_reply("OK swipe left\n");
     } else if (strncmp(line, "SWIPE RIGHT", 11) == 0) {
         if (bsp_display_lock(100)) { if (s_face == FACE_STOPWATCH) face_set(FACE_HOME); bsp_display_unlock(); }
         console_reply("OK swipe right\n");
-    } else if (strncmp(line, "SLAP", 4) == 0) {
-        if (bsp_display_lock(100)) { screen_set(!s_screen_on); bsp_display_unlock(); }
-        console_reply("OK slap\n");
     } else if (strncmp(line, "TAP", 3) == 0) {
         if (bsp_display_lock(100)) { face_toggle(); bsp_display_unlock(); }
         console_reply("OK tap\n");
@@ -246,10 +252,6 @@ static void console_task(void *arg)
 static lv_obj_t *s_time_label;
 static lv_obj_t *s_ampm_label;
 static lv_obj_t *s_date_label;
-static int64_t s_last_touch_us = -1;
-static int64_t s_last_slap_us = -1;
-static void slap_check(const char *source);
-#define SLAP_LOCKOUT_MS        1000   /* ignore further slaps for this long      */
 
 /* ---------------------------------------------------------------------- */
 /* Screen power                                                           */
@@ -261,56 +263,51 @@ static void screen_set(bool on)
         bsp_display_backlight_on();
     } else {
         bsp_display_backlight_off();
-        face_reset_instant();      /* next wake always starts on the clock face */
+        face_reset_instant();      /* next wake always starts on the photo face */
     }
     ESP_LOGI(TAG, "Screen %s", on ? "on" : "off");
 }
 
-/* Tap on the screen. Reserved for future UI actions; currently just logs.
- * (Screen on/off is handled by the palm-slap detector below, not by taps.) */
 static void screen_press_cb(lv_event_t *e)
 {
     (void)e;
-    s_last_touch_us = esp_timer_get_time();
-    slap_check("press");
 }
 
-
+/* Tap on the background: reserved for future UI actions; currently just logs. */
 static void screen_tap_cb(lv_event_t *e)
 {
     (void)e;
-    if (s_last_slap_us >= 0 && esp_timer_get_time() - s_last_slap_us < SLAP_LOCKOUT_MS * 1000LL) {
-        return;    /* this click was the slap itself, not a deliberate tap */
-    }
+    if (touch_quiet()) return;
     lv_point_t pt;
     lv_indev_get_point(lv_indev_active(), &pt);
     ESP_LOGI(TAG, "Tap at (%d, %d)", (int)pt.x, (int)pt.y);
+    corner_tap(pt.x, pt.y);
 }
 
-/* Swipe up -> home face, swipe down -> clock face. */
+/* Tap on the time itself: photo face <-> black clock face. */
+static void time_tap_cb(lv_event_t *e)
+{
+    (void)e;
+    if (!s_screen_on || touch_quiet()) return;
+    if (s_face == FACE_STOPWATCH) return;
+    ESP_LOGI(TAG, "Time tapped");
+    face_toggle();
+}
+
+/* Drag right-to-left on the photo face: stopwatch. Drag left-to-right: back. */
 static void screen_gesture_cb(lv_event_t *e)
 {
     (void)e;
-    if (s_last_slap_us >= 0 && esp_timer_get_time() - s_last_slap_us < SLAP_LOCKOUT_MS * 1000LL) {
-        return;
-    }
     lv_indev_t *indev = lv_indev_active();
     lv_dir_t dir = lv_indev_get_gesture_dir(indev);
     lv_indev_wait_release(indev);          /* don't let the swipe also register as a click */
+    if (!s_screen_on || touch_quiet()) return;
     switch (dir) {
-    case LV_DIR_TOP:
-        ESP_LOGI(TAG, "Swipe up");
-        if (s_face == FACE_CLOCK) face_set(FACE_HOME);
-        break;
-    case LV_DIR_BOTTOM:
-        ESP_LOGI(TAG, "Swipe down");
-        if (s_face == FACE_HOME) face_set(FACE_CLOCK);
-        break;
-    case LV_DIR_LEFT:      /* drag right-to-left on home: pull the stopwatch in from the right edge */
+    case LV_DIR_LEFT:
         ESP_LOGI(TAG, "Swipe left");
         if (s_face == FACE_HOME) face_set(FACE_STOPWATCH);
         break;
-    case LV_DIR_RIGHT:     /* drag left-to-right on the stopwatch: push it back out */
+    case LV_DIR_RIGHT:
         ESP_LOGI(TAG, "Swipe right");
         if (s_face == FACE_STOPWATCH) face_set(FACE_HOME);
         break;
@@ -320,60 +317,33 @@ static void screen_gesture_cb(lv_event_t *e)
 }
 
 /* ---------------------------------------------------------------------- */
-/* Palm-slap detector: wide touch on the glass + an accelerometer jolt     */
-/* arriving within SLAP_WINDOW_MS of each other toggles the screen.       */
+/* Screen on/off: double-tap the top-right corner of the glass.            */
 /* ---------------------------------------------------------------------- */
 #define FT3168_ADDR            0x38
 #define FT_REG_TD_STATUS       0x02
 #define FT_MAX_POINTS          5
 #define SCREEN_W               410
 #define SCREEN_H               502
-
-/* Tunables, calibrated 2026-10-12 with the protective film still on:
- *   fingertip taps   : touch + accel peak <= 0.9 g
- *   palm slaps       : touch + accel peak ~7 g   (glass reports a single point,
- *                      no size info, so the accelerometer does the deciding)
- *   table bump       : ~4 g, NO touch  -> rejected by requiring a contact      */
-#define SLAP_JOLT_G            2.5f   /* |accel| deviation from 1 g for a "hit"  */
-#define SLAP_WINDOW_MS         300    /* touch and jolt must be this close       */
 #define IMU_BOOT_IGNORE_MS     1500   /* first IMU samples after boot are junk   */
-/* Palm path: on the wrist a slap usually lands as a whole palm, which makes the
- * FT3168 stop answering I2C for ~4 s instead of reporting a contact. The onset of
- * a *fresh* silent window is palm-specific, so it only needs a modest jolt. */
-#define PALM_JOLT_G            1.0f
-#define PALM_WINDOW_MS         400
-#define PALM_FRESH_GAP_MS      500    /* window must start this long after the previous one ended */
-static int64_t  s_last_palm_us = -1;
-static int64_t  s_last_jolt_lo_us = -1;
-static int64_t  s_nack_end_us = -1;
+#define CORNER_X_MIN           (SCREEN_W * 60 / 100)   /* right 40 % of the width  */
+#define CORNER_Y_MAX           (SCREEN_H * 30 / 100)   /* top 30 % of the height   */
+#define DTAP_MAX_GAP_MS        500
+static int64_t s_corner_tap1_us = -1;
 
-static int64_t  s_last_jolt_us = -1;
-static float    s_jolt_peak_g = 0;
-
-static void slap_check(const char *source)
+static void corner_tap(int x, int y)
 {
+    if (x < CORNER_X_MIN || y > CORNER_Y_MAX) {
+        s_corner_tap1_us = -1;          /* a tap elsewhere breaks the sequence */
+        return;
+    }
     int64_t now = esp_timer_get_time();
-    if (s_last_slap_us >= 0 && now - s_last_slap_us < SLAP_LOCKOUT_MS * 1000LL) return;
-
-    const char *path = NULL;
-    int64_t gap = 0;
-    if (s_last_touch_us >= 0 && s_last_jolt_us >= 0) {
-        gap = s_last_touch_us - s_last_jolt_us;
-        if (gap < 0) gap = -gap;
-        if (gap <= SLAP_WINDOW_MS * 1000LL) path = "touch+jolt";
-    }
-    if (!path && s_last_palm_us >= 0 && s_last_jolt_lo_us >= 0) {
-        gap = s_last_palm_us - s_last_jolt_lo_us;
-        if (gap < 0) gap = -gap;
-        if (gap <= PALM_WINDOW_MS * 1000LL) path = "palm+jolt";
-    }
-    if (!path) return;
-
-    s_last_slap_us = now;
-    ESP_LOGI(TAG, "SLAP detected (%s via %s, gap %lld ms, jolt %.2f g)", source, path, gap / 1000, s_jolt_peak_g);
-    if (bsp_display_lock(100)) {
-        screen_set(!s_screen_on);
-        bsp_display_unlock();
+    if (s_corner_tap1_us >= 0 && now - s_corner_tap1_us <= DTAP_MAX_GAP_MS * 1000LL) {
+        s_corner_tap1_us = -1;
+        s_touch_quiet_until_us = now + TOUCH_QUIET_AFTER_TOGGLE_MS * 1000LL;
+        ESP_LOGI(TAG, "DOUBLE-TAP corner -> screen %s", s_screen_on ? "off" : "on");
+        screen_set(!s_screen_on);       /* called from the LVGL task: already locked */
+    } else {
+        s_corner_tap1_us = now;
     }
 }
 
@@ -419,18 +389,15 @@ static void touch_poll_task(void *arg)
         if (rd != ESP_OK) {
             if (errors++ == 0) {
                 err_start_us = esp_timer_get_time();
-                bool fresh = (s_nack_end_us < 0) || (err_start_us - s_nack_end_us > PALM_FRESH_GAP_MS * 1000LL);
-                ESP_LOGW(TAG, "TPERR start: %s%s", esp_err_to_name(rd), fresh ? " (palm)" : " (continuing)");
-                if (fresh) {
-                    s_last_palm_us = err_start_us;
-                    slap_check("palm");
-                }
+                ESP_LOGW(TAG, "TPERR start: %s", esp_err_to_name(rd));
             }
             continue;
         }
         if (errors > 0) {
-            s_nack_end_us = esp_timer_get_time();
-            ESP_LOGW(TAG, "TPERR end: %d failures over %lld ms", errors, (s_nack_end_us - err_start_us) / 1000);
+            int64_t end_us = esp_timer_get_time();
+            int64_t q = end_us + TOUCH_QUIET_AFTER_NACK_MS * 1000LL;
+            if (q > s_touch_quiet_until_us) s_touch_quiet_until_us = q;
+            ESP_LOGW(TAG, "TPERR end: %d failures over %lld ms", errors, (end_us - err_start_us) / 1000);
         }
         /* The FT3168 returns one constant byte across the whole frame while a palm
          * covers the glass (palm rejection). Log it; do not treat it as a bus fault. */
@@ -498,8 +465,6 @@ static void touch_poll_task(void *arg)
             ESP_LOGI(TAG, "TOUCH st=0x%02x g=0x%02x n=%d%s", status, gesture, n, detail);
         }
 
-        s_last_touch_us = esp_timer_get_time();
-        slap_check("touch");
     }
 }
 
@@ -508,8 +473,7 @@ static void imu_task(void *arg)
     (void)arg;
     static qmi8658_dev_t dev;
     if (qmi8658_init(&dev, bsp_i2c_get_handle(), QMI8658_ADDRESS_HIGH) != ESP_OK) {
-        ESP_LOGW(TAG, "IMU init failed; slap detection will use touch only");
-        s_last_jolt_us = 0;   /* never gates: treat jolt as always satisfied */
+        ESP_LOGW(TAG, "IMU init failed");
         vTaskDelete(NULL);
         return;
     }
@@ -534,13 +498,6 @@ static void imu_task(void *arg)
         if (esp_timer_get_time() < IMU_BOOT_IGNORE_MS * 1000LL) continue;
         if (dev_g > window_peak) window_peak = dev_g;
 
-        if (dev_g >= PALM_JOLT_G) {
-            s_last_jolt_lo_us = esp_timer_get_time();
-            if (dev_g >= SLAP_JOLT_G) s_last_jolt_us = s_last_jolt_lo_us;
-            s_jolt_peak_g = dev_g;
-            slap_check("imu");
-        }
-
         int64_t now = esp_timer_get_time();
         if (s_calib_log && now - last_log_us > 500000) {   /* twice a second */
             if (window_peak >= 0.15f) {
@@ -552,10 +509,11 @@ static void imu_task(void *arg)
     }
 }
 
-/* Two faces:
- *   FACE_CLOCK : "Hello Luke", big time with seconds, AM/PM, date   (boot default)
- *   FACE_HOME  : time (no seconds) tucked at the top, solid background
- * A tap animates between them. */
+/* Faces:
+ *   FACE_HOME      : random photo, time (no seconds) tucked at the top   (boot default)
+ *   FACE_CLOCK     : black, "Hello Luke", big time with seconds, AM/PM, date
+ *   FACE_STOPWATCH : black sheet slid in from the right over the photo face
+ * Tapping the time flips HOME <-> CLOCK with an animation. */
 
 #define HOME_BG_COLOR        0x1B3A5C     /* solid background on the home face */
 #define FACE_ANIM_MS         450
@@ -837,6 +795,8 @@ static void sw_build(lv_obj_t *scr)
     lv_obj_set_style_pad_all(s_sw_panel, 0, 0);
     lv_obj_remove_flag(s_sw_panel, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(s_sw_panel, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(s_sw_panel, LV_OBJ_FLAG_GESTURE_BUBBLE);
+    lv_obj_add_event_cb(s_sw_panel, screen_tap_cb, LV_EVENT_CLICKED, NULL);
 
     lv_obj_t *title = lv_label_create(s_sw_panel);
     lv_label_set_text(title, "Stopwatch");
@@ -930,7 +890,7 @@ static void face_set(face_t face)
     fade(s_ampm_label,  !home);
 }
 
-/* Jump straight to the clock face with no animation (used while the screen is dark). */
+/* Jump straight to the photo face with a fresh picture, no animation (used while dark). */
 static void face_reset_instant(void)
 {
     lv_anim_delete(s_time_label, NULL);
@@ -941,23 +901,26 @@ static void face_reset_instant(void)
     lv_anim_delete(s_sw_panel, NULL);
     lv_anim_delete(lv_screen_active(), NULL);
 
-    s_face = FACE_CLOCK;
+    s_face = FACE_HOME;
     lv_obj_set_style_bg_color(lv_screen_active(), lv_color_black(), 0);
 
-    lv_obj_set_style_opa(s_photo, 0, 0);
-    lv_obj_add_flag(s_photo, LV_OBJ_FLAG_HIDDEN);
+    if (PIC_COUNT > 0) {
+        photo_pick_random();
+        lv_obj_remove_flag(s_photo, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_set_style_opa(s_photo, 255, 0);
+    }
     lv_obj_set_x(s_sw_panel, SCREEN_W);
     lv_obj_add_flag(s_sw_panel, LV_OBJ_FLAG_HIDDEN);
 
-    lv_obj_t *show[] = { s_hello_label, s_date_label, s_ampm_label };
-    for (size_t i = 0; i < sizeof(show) / sizeof(show[0]); i++) {
-        lv_obj_remove_flag(show[i], LV_OBJ_FLAG_HIDDEN);
-        lv_obj_set_style_opa(show[i], 255, 0);
+    lv_obj_t *hide[] = { s_hello_label, s_date_label, s_ampm_label };
+    for (size_t i = 0; i < sizeof(hide) / sizeof(hide[0]); i++) {
+        lv_obj_add_flag(hide[i], LV_OBJ_FLAG_HIDDEN);
+        lv_obj_set_style_opa(hide[i], 0, 0);
     }
 
     clock_tick(NULL);
     lv_obj_update_layout(s_time_label);
-    anim_time_y_cb(s_time_label, time_label_target_y(FACE_CLOCK));
+    anim_time_y_cb(s_time_label, time_label_target_y(FACE_HOME));
 }
 
 static void face_toggle(void)
@@ -998,6 +961,8 @@ static void build_ui(void)
     lv_obj_set_style_radius(s_time_label, 14, 0);
     lv_obj_set_style_pad_hor(s_time_label, 14, 0);
     lv_obj_set_style_pad_ver(s_time_label, 6, 0);
+    lv_obj_add_flag(s_time_label, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(s_time_label, time_tap_cb, LV_EVENT_CLICKED, NULL);
 
     s_ampm_label = lv_label_create(scr);
     lv_obj_set_style_text_font(s_ampm_label, &lv_font_montserrat_20, 0);
@@ -1009,12 +974,11 @@ static void build_ui(void)
     lv_obj_set_style_text_color(s_date_label, lv_color_hex(0xB0BEC5), 0);
     lv_obj_align(s_date_label, LV_ALIGN_CENTER, 0, 80);
 
-    clock_tick(NULL);
-    lv_obj_update_layout(s_time_label);
-    anim_time_y_cb(s_time_label, time_label_target_y(FACE_CLOCK));
     lv_timer_create(clock_tick, 250, NULL);
-
     sw_build(scr);
+
+    s_face = FACE_CLOCK;          /* so the reset below actually lays out HOME */
+    face_reset_instant();
 }
 
 void app_main(void)

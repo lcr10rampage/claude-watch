@@ -13,22 +13,28 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/idf_additions.h"
 #include "esp_log.h"
 #include "esp_err.h"
 #include "esp_check.h"
 #include "driver/i2c_master.h"
 #include "driver/gpio.h"
 #include "esp_system.h"
+#include "esp_pm.h"
+#include "esp_sleep.h"
 #include "esp_attr.h"
 #include "driver/usb_serial_jtag.h"
 #include "esp_timer.h"
 #include "esp_random.h"
 #include "qmi8658.h"
+#include "net.h"
+#include "esp_heap_caps.h"
 #include "lvgl.h"
 #include "bsp/esp-bsp.h"
 #include "bsp/display.h"
 
 static const char *TAG = "hello_luke";
+#define ENABLE_NET 1   /* 1 = join Wi-Fi at boot and talk to the Pi (needs main/secrets.h) */
 typedef enum { FACE_CLOCK = 0, FACE_HOME, FACE_STOPWATCH } face_t;
 static face_t s_face;
 static void face_set(face_t face);
@@ -75,6 +81,9 @@ static int64_t s_touch_quiet_until_us = 0;
 #define TOUCH_QUIET_AFTER_NACK_MS     400
 static inline bool touch_quiet(void) { return esp_timer_get_time() < s_touch_quiet_until_us; }
 static void corner_tap(int x, int y);
+static void claude_ask(const char *question);
+static void claude_button(void);
+static void clock_tick(lv_timer_t *timer);
 static bool s_raw_diff = false;   /* unused now; kept for the RAW serial command */
 static bool s_calib_log = false;  /* calibration logging, "LOG ON|OFF" over serial */
 
@@ -193,6 +202,53 @@ static void clock_setup(void)
 }
 
 /* ---------------------------------------------------------------------- */
+/* AXP2101 PMU: battery gauge (I2C 0x34)                                  */
+/* ---------------------------------------------------------------------- */
+#define AXP2101_ADDR        0x34
+#define AXP_STATUS1         0x00   /* bit3: battery present            */
+#define AXP_STATUS2         0x01   /* bits7:5: 01 charging, 10 discharging */
+#define AXP_ADC_CTRL        0x30   /* bit0: enable VBAT ADC            */
+#define AXP_VBAT_H          0x34   /* [4:0] high bits, 0x35 low byte   */
+#define AXP_BAT_PERCENT     0xA4
+static i2c_master_dev_handle_t s_pmu = NULL;
+
+static esp_err_t pmu_rd(uint8_t reg, uint8_t *val)
+{
+    return i2c_master_transmit_receive(s_pmu, &reg, 1, val, 1, 50);
+}
+
+static esp_err_t pmu_init(void)
+{
+    i2c_device_config_t cfg = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address  = AXP2101_ADDR,
+        .scl_speed_hz    = 400000,
+    };
+    ESP_RETURN_ON_ERROR(i2c_master_bus_add_device(bsp_i2c_get_handle(), &cfg, &s_pmu), TAG, "add PMU");
+    uint8_t adc = 0;
+    if (pmu_rd(AXP_ADC_CTRL, &adc) == ESP_OK) {
+        uint8_t w[2] = { AXP_ADC_CTRL, (uint8_t)(adc | 0x01) };
+        i2c_master_transmit(s_pmu, w, 2, 50);
+    }
+    return ESP_OK;
+}
+
+/* Returns false if the PMU can't be read. state: 'C' charging, 'D' discharging, 'S' standby/full */
+static bool pmu_read(int *mv, int *pct, char *state)
+{
+    if (!s_pmu) return false;
+    uint8_t s1 = 0, s2 = 0, h = 0, l = 0, p = 0;
+    if (pmu_rd(AXP_STATUS1, &s1) != ESP_OK || pmu_rd(AXP_STATUS2, &s2) != ESP_OK) return false;
+    pmu_rd(AXP_VBAT_H, &h); pmu_rd(AXP_VBAT_H + 1, &l); pmu_rd(AXP_BAT_PERCENT, &p);
+    bool batt = s1 & 0x08;
+    *mv  = batt ? (((h & 0x1F) << 8) | l) : 0;
+    *pct = batt ? p : -1;
+    int chg = (s2 >> 5) & 0x03;
+    *state = chg == 1 ? 'C' : chg == 2 ? 'D' : 'S';
+    return true;
+}
+
+/* ---------------------------------------------------------------------- */
 /* Serial console: lets the host set the clock precisely over USB.        */
 /*   SETTIME YYYY-MM-DD HH:MM:SS   -> sets RTC + system time, replies OK  */
 /*   GETTIME                       -> replies with the current time       */
@@ -230,6 +286,31 @@ static void console_handle_line(char *line)
     } else if (strncmp(line, "TIMETAP", 7) == 0) {
         if (bsp_display_lock(100)) { if (s_face != FACE_STOPWATCH) face_toggle(); bsp_display_unlock(); }
         console_reply("OK timetap\n");
+    } else if (strncmp(line, "ASK ", 4) == 0) {
+        if (bsp_display_lock(200)) { if (!s_screen_on) screen_set(true); claude_ask(line + 4); bsp_display_unlock(); }
+        console_reply("OK asking\n");
+    } else if (strncmp(line, "BOOT", 4) == 0) {
+        claude_button();
+        console_reply("OK boot\n");
+    } else if (strncmp(line, "WIFI", 4) == 0) {
+        char out[96], ip[20];
+        net_ip(ip, sizeof(ip));
+        snprintf(out, sizeof(out), "WIFI %s ip %s rssi %d dBm, server %s\n", net_connected() ? "connected" : "down", ip, net_rssi(), net_health() ? "ok" : "unreachable");
+        console_reply(out);
+    } else if (strncmp(line, "HEAP", 4) == 0) {
+        char out[96];
+        snprintf(out, sizeof(out), "HEAP internal %u free (largest %u), dma %u free (largest %u), psram %u free\n",
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL), (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL), (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL),
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+        console_reply(out);
+    } else if (strncmp(line, "BATT", 4) == 0) {
+        int mv, pct; char st;
+        char out[64];
+        if (pmu_read(&mv, &pct, &st)) snprintf(out, sizeof(out), "BATT %d%% %d mV %s\n", pct, mv,
+                                               st == 'C' ? "charging" : st == 'D' ? "discharging" : "standby");
+        else snprintf(out, sizeof(out), "ERR pmu\n");
+        console_reply(out);
     } else if (strncmp(line, "DUMP", 4) == 0) {
         uint32_t head = s_evlog_head;
         uint32_t n = head < EVLOG_N ? head : EVLOG_N;
@@ -300,16 +381,75 @@ static lv_obj_t *s_ampm_label;
 static lv_obj_t *s_date_label;
 
 /* ---------------------------------------------------------------------- */
+/* Power modes                                                            */
+/*   screen ON : CPU pinned at 240 MHz, no light sleep, full-rate polling   */
+/*   screen OFF: locks released -> DFS down to 80 MHz and automatic light   */
+/*               sleep between events (not while USB is connected); LVGL   */
+/*               clock timers paused, touch polled slower, IMU suspended.   */
+/* ---------------------------------------------------------------------- */
+static esp_pm_lock_handle_t s_lock_cpu_max, s_lock_no_sleep;
+static TaskHandle_t  s_imu_task = NULL;
+static lv_timer_t   *s_clock_timer = NULL, *s_sw_timer = NULL;
+static volatile int  s_touch_poll_ms = 20;
+#define TOUCH_POLL_ON_MS       20
+#define TOUCH_POLL_OFF_MS      60
+#define LVGL_INDEV_OFF_MS      60
+
+static void power_init(void)
+{
+    esp_pm_config_t pm = { .max_freq_mhz = 240, .min_freq_mhz = 80, .light_sleep_enable = true };
+    esp_err_t err = esp_pm_configure(&pm);
+    ESP_LOGI(TAG, "PM configure: %s", esp_err_to_name(err));
+    esp_pm_lock_create(ESP_PM_CPU_FREQ_MAX, 0, "ui_cpu", &s_lock_cpu_max);
+    esp_pm_lock_create(ESP_PM_NO_LIGHT_SLEEP, 0, "ui_awake", &s_lock_no_sleep);
+    esp_pm_lock_acquire(s_lock_cpu_max);
+    esp_pm_lock_acquire(s_lock_no_sleep);
+    /* a touch (INT low) wakes the chip from light sleep immediately */
+    gpio_wakeup_enable(BSP_LCD_TOUCH_INT, GPIO_INTR_LOW_LEVEL);
+    esp_sleep_enable_gpio_wakeup();
+}
+
+static void power_mode(bool on)
+{
+    static bool current = true;
+    if (on == current) return;
+    current = on;
+    lv_indev_t *indev = bsp_display_get_input_dev();
+    lv_timer_t *read_timer = indev ? lv_indev_get_read_timer(indev) : NULL;
+    if (on) {
+        esp_pm_lock_acquire(s_lock_cpu_max);
+        esp_pm_lock_acquire(s_lock_no_sleep);
+        if (s_clock_timer) lv_timer_resume(s_clock_timer);
+        if (s_sw_timer)    lv_timer_resume(s_sw_timer);
+        if (read_timer)    lv_timer_set_period(read_timer, LV_DEF_REFR_PERIOD);
+        s_touch_poll_ms = TOUCH_POLL_ON_MS;
+        if (s_imu_task) vTaskResume(s_imu_task);
+    } else {
+        if (s_clock_timer) lv_timer_pause(s_clock_timer);
+        if (s_sw_timer)    lv_timer_pause(s_sw_timer);
+        if (read_timer)    lv_timer_set_period(read_timer, LVGL_INDEV_OFF_MS);
+        s_touch_poll_ms = TOUCH_POLL_OFF_MS;
+        if (s_imu_task) vTaskSuspend(s_imu_task);
+        esp_pm_lock_release(s_lock_no_sleep);
+        esp_pm_lock_release(s_lock_cpu_max);
+    }
+    ESP_LOGI(TAG, "Power mode: %s", on ? "awake" : "low-power");
+}
+
+/* ---------------------------------------------------------------------- */
 /* Screen power                                                           */
 /* ---------------------------------------------------------------------- */
 static void screen_set(bool on)
 {
     s_screen_on = on;
     if (on) {
+        power_mode(true);
+        clock_tick(NULL);          /* timers were paused: refresh before showing */
         bsp_display_backlight_on();
     } else {
         bsp_display_backlight_off();
         face_reset_instant();      /* next wake always starts on the photo face */
+        power_mode(false);
     }
     ESP_LOGI(TAG, "Screen %s", on ? "on" : "off");
     evlog_add('S', on ? 1 : 0, 0);
@@ -467,7 +607,7 @@ static void touch_poll_task(void *arg)
 
 
     for (;;) {
-        vTaskDelay(pdMS_TO_TICKS(20));
+        vTaskDelay(pdMS_TO_TICKS(s_touch_poll_ms));
         esp_err_t rd = i2c_master_transmit_receive(tp, &reg, 1, buf, sizeof(buf), 50);
         if (rd != ESP_OK) {
             if (errors++ == 0) {
@@ -915,7 +1055,7 @@ static void sw_build(lv_obj_t *scr)
     lv_obj_align(b2, LV_ALIGN_BOTTOM_MID, 0, -30);
 
     sw_render();
-    lv_timer_create(sw_tick, 100, NULL);
+    s_sw_timer = lv_timer_create(sw_tick, 100, NULL);
 
     lv_obj_move_foreground(s_time_label);   /* time stays visible above the black sheet */
 }
@@ -1028,6 +1168,240 @@ static void face_toggle(void)
     face_set(s_face == FACE_CLOCK ? FACE_HOME : FACE_CLOCK);
 }
 
+/* ---------------------------------------------------------------------- */
+/* Claude overlay (WATCH_DESIGN.md section 1)                              */
+/*   LISTENING : orange ring around the edge                                */
+/*   WORKING   : the ring pulses while the Pi asks Claude                   */
+/*   ANSWER    : orange fills the screen, answer in a scrollable box        */
+/* Tap the screen or press BOOT to dismiss.                                 */
+/* ---------------------------------------------------------------------- */
+#define CLAUDE_ORANGE        0xD97757
+#define CLAUDE_BOX_BG        0xFFF4EC
+#define CLAUDE_RING_RADIUS   120    /* match the glass's rounded corners */
+#define CLAUDE_RING_WIDTH    16
+#define BOOT_BUTTON_GPIO     GPIO_NUM_0
+
+typedef enum { CL_IDLE = 0, CL_MENU, CL_LISTENING, CL_WORKING, CL_ANSWER } claude_state_t;
+static claude_state_t s_cl_state = CL_IDLE;
+static lv_obj_t *s_cl_layer, *s_cl_ring, *s_cl_box, *s_cl_text, *s_cl_menu;
+#define CLAUDE_DIM_OPA       LV_OPA_70   /* how much the photo is darkened behind the menu */
+static lv_anim_t s_cl_pulse;
+
+static void anim_border_opa_cb(void *obj, int32_t v)
+{
+    lv_obj_set_style_border_opa((lv_obj_t *)obj, (lv_opa_t)v, 0);
+}
+
+static void claude_set_state(claude_state_t st, const char *text)
+{
+    s_cl_state = st;
+    lv_anim_delete(s_cl_ring, anim_border_opa_cb);
+    switch (st) {
+    case CL_IDLE:
+        lv_obj_add_flag(s_cl_layer, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(s_cl_menu, LV_OBJ_FLAG_HIDDEN);
+        break;
+    case CL_MENU:
+        lv_obj_remove_flag(s_cl_layer, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_set_style_bg_color(s_cl_layer, lv_color_black(), 0);
+        lv_obj_set_style_bg_opa(s_cl_layer, CLAUDE_DIM_OPA, 0);
+        lv_obj_add_flag(s_cl_box, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_remove_flag(s_cl_ring, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_set_style_border_opa(s_cl_ring, LV_OPA_COVER, 0);
+        lv_obj_remove_flag(s_cl_menu, LV_OBJ_FLAG_HIDDEN);
+        break;
+    case CL_LISTENING:
+    case CL_WORKING:
+        lv_obj_remove_flag(s_cl_layer, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_set_style_bg_color(s_cl_layer, lv_color_black(), 0);
+        lv_obj_set_style_bg_opa(s_cl_layer, CLAUDE_DIM_OPA, 0);
+        lv_obj_add_flag(s_cl_menu, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(s_cl_box, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_remove_flag(s_cl_ring, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_set_style_border_opa(s_cl_ring, LV_OPA_COVER, 0);
+        if (st == CL_WORKING) {
+            lv_anim_init(&s_cl_pulse);
+            lv_anim_set_var(&s_cl_pulse, s_cl_ring);
+            lv_anim_set_exec_cb(&s_cl_pulse, anim_border_opa_cb);
+            lv_anim_set_values(&s_cl_pulse, 255, 60);
+            lv_anim_set_duration(&s_cl_pulse, 600);
+            lv_anim_set_playback_duration(&s_cl_pulse, 600);
+            lv_anim_set_repeat_count(&s_cl_pulse, LV_ANIM_REPEAT_INFINITE);
+            lv_anim_start(&s_cl_pulse);
+        }
+        break;
+    case CL_ANSWER:
+        lv_obj_remove_flag(s_cl_layer, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(s_cl_ring, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(s_cl_menu, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_set_style_bg_color(s_cl_layer, lv_color_hex(CLAUDE_ORANGE), 0);
+        lv_obj_set_style_bg_opa(s_cl_layer, LV_OPA_COVER, 0);
+        lv_obj_remove_flag(s_cl_box, LV_OBJ_FLAG_HIDDEN);
+        lv_label_set_text(s_cl_text, text ? text : "");
+        lv_obj_scroll_to_y(s_cl_box, 0, LV_ANIM_OFF);
+        break;
+    }
+}
+
+static void claude_layer_tap_cb(lv_event_t *e)
+{
+    (void)e;
+    if (s_cl_state == CL_ANSWER) {
+        ESP_LOGI(TAG, "Answer dismissed");
+        claude_set_state(CL_IDLE, NULL);
+    }
+}
+
+/* Runs in its own task: asks the Pi, then shows the answer. */
+static void ask_task(void *arg)
+{
+    char *question = (char *)arg;
+    char *answer = NULL;
+    int status = 0;
+    ESP_LOGI(TAG, "Asking: %s", question);
+    esp_err_t err = net_ask(question, &answer, &status);
+    ESP_LOGI(TAG, "Answer (%s, http %d): %s", esp_err_to_name(err), status, answer ? answer : "");
+    evlog_add('Q', (int)(err == ESP_OK), status);
+    if (bsp_display_lock(500)) {
+        if (!s_screen_on) screen_set(true);
+        claude_set_state(CL_ANSWER, answer);
+        bsp_display_unlock();
+    }
+    free(answer);
+    free(question);
+    vTaskDelete(NULL);
+}
+
+static void claude_ask(const char *question)
+{
+    if (s_cl_state == CL_WORKING) return;
+    claude_set_state(CL_WORKING, NULL);
+    xTaskCreateWithCaps(ask_task, "ask", 8192, strdup(question), 3, NULL, MALLOC_CAP_SPIRAM);
+}
+
+/* BOOT button: opens the Claude menu; pressing it again (from any Claude state)
+ * closes everything and returns to the watch face. */
+static void claude_button(void)
+{
+    if (!bsp_display_lock(200)) return;
+    if (!s_screen_on) screen_set(true);
+    if (s_cl_state == CL_IDLE) {
+        ESP_LOGI(TAG, "BOOT: menu");
+        claude_set_state(CL_MENU, NULL);
+    } else if (s_cl_state != CL_WORKING) {
+        ESP_LOGI(TAG, "BOOT: close");
+        claude_set_state(CL_IDLE, NULL);
+    }
+    bsp_display_unlock();
+}
+
+static void boot_button_task(void *arg)
+{
+    (void)arg;
+    gpio_config_t io = {
+        .pin_bit_mask = 1ULL << BOOT_BUTTON_GPIO,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+    };
+    gpio_config(&io);
+    int stable = 1, last = 1;
+    int64_t changed_us = 0;
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(20));
+        int v = gpio_get_level(BOOT_BUTTON_GPIO);
+        int64_t now = esp_timer_get_time();
+        if (v != last) { last = v; changed_us = now; continue; }
+        if (v != stable && now - changed_us > 40000) {      /* 40 ms debounce */
+            stable = v;
+            if (stable == 0) claude_button();                /* active low */
+        }
+    }
+}
+
+static const char *const s_menu_questions[] = {
+    "What's today's date?",
+    "What's the weather right now?",
+    "What's my latest email about? One sentence.",
+    "What's on my calendar today?",
+};
+static const char *const s_menu_labels[] = { "Date", "Weather", "Latest email", "Calendar today" };
+
+static void menu_button_cb(lv_event_t *e)
+{
+    int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    ESP_LOGI(TAG, "Menu: %s", s_menu_labels[idx]);
+    claude_ask(s_menu_questions[idx]);
+}
+
+static void claude_build(lv_obj_t *scr)
+{
+    s_cl_layer = lv_obj_create(scr);
+    lv_obj_set_size(s_cl_layer, SCREEN_W, SCREEN_H);
+    lv_obj_set_pos(s_cl_layer, 0, 0);
+    lv_obj_set_style_bg_color(s_cl_layer, lv_color_hex(CLAUDE_ORANGE), 0);
+    lv_obj_set_style_bg_opa(s_cl_layer, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(s_cl_layer, 0, 0);
+    lv_obj_set_style_radius(s_cl_layer, 0, 0);
+    lv_obj_set_style_pad_all(s_cl_layer, 0, 0);
+    lv_obj_remove_flag(s_cl_layer, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(s_cl_layer, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_event_cb(s_cl_layer, claude_layer_tap_cb, LV_EVENT_CLICKED, NULL);
+
+    s_cl_ring = lv_obj_create(s_cl_layer);
+    lv_obj_set_size(s_cl_ring, SCREEN_W, SCREEN_H);
+    lv_obj_set_pos(s_cl_ring, 0, 0);
+    lv_obj_set_style_bg_opa(s_cl_ring, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_color(s_cl_ring, lv_color_hex(CLAUDE_ORANGE), 0);
+    lv_obj_set_style_border_width(s_cl_ring, CLAUDE_RING_WIDTH, 0);
+    lv_obj_set_style_radius(s_cl_ring, CLAUDE_RING_RADIUS, 0);
+    lv_obj_set_style_pad_all(s_cl_ring, 0, 0);
+    lv_obj_remove_flag(s_cl_ring, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+
+    s_cl_box = lv_obj_create(s_cl_layer);
+    lv_obj_set_size(s_cl_box, SCREEN_W - 50, SCREEN_H - 110);
+    lv_obj_center(s_cl_box);
+    lv_obj_set_style_bg_color(s_cl_box, lv_color_hex(CLAUDE_BOX_BG), 0);
+    lv_obj_set_style_bg_opa(s_cl_box, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(s_cl_box, 0, 0);
+    lv_obj_set_style_radius(s_cl_box, 26, 0);
+    lv_obj_set_style_pad_all(s_cl_box, 18, 0);
+    lv_obj_set_scroll_dir(s_cl_box, LV_DIR_VER);
+    lv_obj_add_flag(s_cl_box, LV_OBJ_FLAG_EVENT_BUBBLE);  /* taps on the box also dismiss */
+
+    s_cl_menu = lv_obj_create(s_cl_layer);
+    lv_obj_set_size(s_cl_menu, SCREEN_W - 2 * CLAUDE_RING_WIDTH - 20, LV_SIZE_CONTENT);
+    lv_obj_center(s_cl_menu);
+    lv_obj_set_style_bg_opa(s_cl_menu, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(s_cl_menu, 0, 0);
+    lv_obj_set_style_pad_all(s_cl_menu, 0, 0);
+    lv_obj_set_style_pad_row(s_cl_menu, 16, 0);
+    lv_obj_set_flex_flow(s_cl_menu, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(s_cl_menu, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_remove_flag(s_cl_menu, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(s_cl_menu, LV_OBJ_FLAG_HIDDEN);
+    for (int i = 0; i < (int)(sizeof(s_menu_labels) / sizeof(s_menu_labels[0])); i++) {
+        lv_obj_t *btn = lv_button_create(s_cl_menu);
+        lv_obj_set_size(btn, 290, 66);
+        lv_obj_set_style_bg_color(btn, lv_color_hex(CLAUDE_ORANGE), 0);
+        lv_obj_set_style_radius(btn, 33, 0);
+        lv_obj_set_style_shadow_width(btn, 0, 0);
+        lv_obj_add_event_cb(btn, menu_button_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+        lv_obj_t *lbl = lv_label_create(btn);
+        lv_label_set_text(lbl, s_menu_labels[i]);
+        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_20, 0);
+        lv_obj_set_style_text_color(lbl, lv_color_white(), 0);
+        lv_obj_center(lbl);
+    }
+
+    s_cl_text = lv_label_create(s_cl_box);
+    lv_obj_set_width(s_cl_text, SCREEN_W - 50 - 36);
+    lv_label_set_long_mode(s_cl_text, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_font(s_cl_text, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(s_cl_text, lv_color_hex(0x2B2118), 0);
+    lv_obj_set_style_text_line_space(s_cl_text, 6, 0);
+    lv_label_set_text(s_cl_text, "");
+}
+
 static void build_ui(void)
 {
     lv_obj_t *scr = lv_screen_active();
@@ -1074,16 +1448,51 @@ static void build_ui(void)
     lv_obj_set_style_text_color(s_date_label, lv_color_hex(0xB0BEC5), 0);
     lv_obj_align(s_date_label, LV_ALIGN_CENTER, 0, 80);
 
-    lv_timer_create(clock_tick, 250, NULL);
+    s_clock_timer = lv_timer_create(clock_tick, 250, NULL);
     sw_build(scr);
+
+    claude_build(scr);
 
     s_face = FACE_CLOCK;          /* so the reset below actually lays out HOME */
     face_reset_instant();
 }
 
+static void battery_task(void *arg)
+{
+    (void)arg;
+    if (pmu_init() != ESP_OK) { ESP_LOGW(TAG, "PMU init failed"); vTaskDelete(NULL); return; }
+    char last_state = 0;
+    int64_t last_log_us = -600LL * 1000000;
+    for (;;) {
+        int mv, pct; char st;
+        if (pmu_read(&mv, &pct, &st)) {
+            int64_t now = esp_timer_get_time();
+            if (st != last_state) {
+                evlog_add('P', st, pct);
+                ESP_LOGI(TAG, "Battery %d%% %d mV, %s", pct, mv, st == 'C' ? "charging" : st == 'D' ? "discharging" : "standby");
+                last_state = st;
+            }
+            if (now - last_log_us >= 300LL * 1000000) {
+                evlog_add('V', pct, mv / 10);
+                last_log_us = now;
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(10000));
+    }
+}
+
 void app_main(void)
 {
     evlog_init();
+    power_init();
+#if ENABLE_NET
+    /* Wi-Fi first: it needs ~70 KB of contiguous internal RAM, which only exists
+     * before the display takes its DMA draw buffer. */
+    net_init();
+#endif
+    ESP_LOGI(TAG, "before display: internal free %u (largest %u)",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
     bsp_display_start();
     clock_setup();
 
@@ -1091,8 +1500,10 @@ void app_main(void)
     build_ui();
     bsp_display_unlock();
 
-    xTaskCreate(console_task, "console", 4096, NULL, 3, NULL);
-    xTaskCreate(touch_poll_task, "touch_poll", 4096, NULL, 4, NULL);
-    xTaskCreate(imu_task, "imu", 4096, NULL, 4, NULL);
+    xTaskCreateWithCaps(console_task, "console", 4096, NULL, 3, NULL, MALLOC_CAP_SPIRAM);
+    xTaskCreateWithCaps(touch_poll_task, "touch_poll", 4096, NULL, 4, NULL, MALLOC_CAP_SPIRAM);
+    xTaskCreateWithCaps(imu_task, "imu", 4096, NULL, 4, &s_imu_task, MALLOC_CAP_SPIRAM);
+    xTaskCreateWithCaps(battery_task, "battery", 3072, NULL, 2, NULL, MALLOC_CAP_SPIRAM);
+    xTaskCreateWithCaps(boot_button_task, "boot_btn", 3072, NULL, 3, NULL, MALLOC_CAP_SPIRAM);
     ESP_LOGI(TAG, "Hello Luke clock running");
 }

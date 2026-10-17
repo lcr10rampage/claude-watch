@@ -13,3 +13,4 @@ firmware/*/managed_components/
 firmware/*/sdkconfig
 firmware/*/sdkconfig.old
 firmware/*/main/pics/pic_*.bin
+firmware/*/main/secrets.h

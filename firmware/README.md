@@ -16,6 +16,19 @@ What it does today:
   glass, taps ≤ 500 ms apart) → screen off; same again → screen on. Works on
   every face and while the screen is dark. Waking always lands on the photo
   face with a fresh picture.
+- **Claude (BOOT button)**: press BOOT → the photo dims, an orange ring hugs the
+  glass, and buttons appear: Date, Weather, Latest email, Calendar today. Tap
+  one → the ring pulses while the Pi asks Claude → the answer appears in a box
+  on an orange screen. Tap the answer or press BOOT to close; BOOT also closes
+  the menu. (Voice input is step 3; `ASK <text>` over serial sends any question.)
+- **Wi-Fi**: joins at boot and reconnects on its own. Credentials, the Pi's
+  address and the server token live in `main/secrets.h` (git-ignored; copy
+  `secrets.h.example`). Wi-Fi power save is off for link reliability.
+- **Sleep mode**: when the screen is off the CPU drops to 80 MHz and light-sleeps
+  between events, LVGL timers pause, touch polls slower, the IMU task is
+  suspended. Light sleep is automatically disabled while USB is connected.
+- **Battery**: read from the AXP2101 (`BATT` over serial), logged to the event
+  ring every 5 minutes.
 - Time comes from the on-board PCF85063 RTC, seeded from the build timestamp
   on first boot and resyncable from the Pi with `./settime.sh`.
 
@@ -23,6 +36,26 @@ Slap / palm-cover detection was tried for two days and dropped: on the wrist a
 palm shows up as a normal contact, as a controller lockout, or as nothing at
 all, and slap jolts overlap hard taps. The accelerometer task still runs for
 logging only.
+
+### Memory layout (why `components/esp32_s3_touch_amoled_2_06` exists)
+
+Wi-Fi and the display both want the ESP32-S3's ~260 KB of internal RAM. The
+stock BSP let LVGL's draw buffer land in PSRAM and the SPI driver then needed a
+temporary DMA copy per flush, which fails once Wi-Fi fragments internal RAM.
+The local copy of the BSP (takes precedence over the managed one) sets
+`buff_dma = true`, `double_buffer = true`, `sw_rotate = false` and a 50-row
+buffer: two 41 KB DMA buffers allocated once at boot, after Wi-Fi is started
+(`net_init()` runs before `bsp_display_start()`). Single-buffered direct DMA
+produced lines and colour distortion; double buffering fixed it. Plus in
+`sdkconfig.defaults`: Wi-Fi/LVGL code kept out of IRAM, task stacks in PSRAM
+(`xTaskCreateWithCaps`), `SPIRAM_MALLOC_ALWAYSINTERNAL=2048`. Result: ~100 KB
+internal free with everything running (`HEAP` over serial).
+
+### Network gotcha
+
+The router bridges its 2.4 GHz and 5 GHz radios badly. The watch is 2.4 GHz
+only; the Pi must be on 2.4 GHz too or they can't reach each other:
+`nmcli connection modify <profile> 802-11-wireless.band bg`.
 
 ### Build & flash (on the Pi)
 
@@ -37,6 +70,7 @@ cd firmware/hello_luke
 # photos in attachments.zip (unzip it somewhere first), excluding any you like:
 /usr/bin/python3 -I tools/make_pics.py /path/to/unzipped main/pics 1000002544 1000017046
 
+cp main/secrets.h.example main/secrets.h   # then fill in Wi-Fi + server token
 idf.py set-target esp32s3        # first time only
 idf.py -p /dev/ttyACM0 -b 921600 flash
 ./settime.sh                     # push the Pi's current time to the watch
@@ -47,7 +81,8 @@ Stop any serial listener before flashing; the port cannot be shared.
 ### Serial console (115200 on /dev/ttyACM0)
 
 `SETTIME YYYY-MM-DD HH:MM:SS`, `GETTIME`, `TIMETAP` (photo ↔ clock face),
-`SWIPE LEFT|RIGHT` (stopwatch in/out), `DTAP` (toggle screen), `TAP`,
+`SWIPE LEFT|RIGHT` (stopwatch in/out), `DTAP` (toggle screen), `BOOT` (Claude
+menu), `ASK <question>`, `WIFI` (ip, rssi, server reachable), `HEAP`, `BATT`,
 `DUMP` (on-device event log), `LOG ON|OFF` (verbose touch/accelerometer logging).
 
 ### Helper scripts (`tools/`, run with the ESP-IDF venv's python for pyserial)

@@ -89,8 +89,34 @@ Watch ──Wi-Fi──▶ server/server.py (Pi) ──▶ claude -p ──▶ t
    python3 ask.py --token <token> --brief
    ```
 
-8. **Start it on boot** (optional): see the comments in
-   `server/claude-watch.service`. Change `pi` to your username if it's different.
+8. **Start it on boot**: either the system unit in `server/claude-watch.service`
+   (edit the username and paths, then `sudo cp` + `sudo systemctl enable --now
+   claude-watch`), or without sudo as a user unit: copy it to
+   `~/.config/systemd/user/`, delete the `User=` line, change `WantedBy` to
+   `default.target`, then `systemctl --user enable --now claude-watch` and
+   `loginctl enable-linger $USER` so it runs with nobody logged in.
+
+## Using the watch away from home (Tailscale Funnel)
+
+Home routers behind carrier-grade NAT (Verizon 5G Home, for one) can't port
+forward, so the Pi dials out instead. Tailscale Funnel gives it a permanent
+public HTTPS name with nothing else to configure:
+
+```bash
+curl -fsSL https://tailscale.com/install.sh | sh
+sudo tailscale up                     # sign in via the printed link
+sudo tailscale funnel --bg 8787       # prints https://<pi>.<tailnet>.ts.net
+sudo tailscale set --operator=$USER   # lets you run tailscale commands without sudo
+curl https://<pi>.<tailnet>.ts.net/health   # {"ok": true}
+```
+
+MagicDNS and HTTPS Certificates must be on in the Tailscale admin console
+(DNS tab). The first certificate can fail for a while with
+`set-dns ... 500 failed to create DNS record` (Tailscale-side, see
+tailscale/tailscale#19942); it cleared on its own within the hour here.
+Funnel and tailscaled restart on boot by themselves. Put the URL in the
+watch's `main/secrets.h` as `WATCH_SERVER_URL`; the `X-Watch-Token` header is
+the only thing guarding the endpoint, so keep the token long and private.
 
 ## Adding a new API
 

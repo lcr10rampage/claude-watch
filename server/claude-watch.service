@@ -10,11 +10,13 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-User=pi
-WorkingDirectory=/home/pi/claude-watch/server
-EnvironmentFile=/home/pi/claude-watch/server/.env
-ExecStart=/usr/bin/python3 /home/pi/claude-watch/server/server.py
-Restart=on-failure
+User=lcr10rampage
+WorkingDirectory=/home/lcr10rampage/claude-watch/server
+EnvironmentFile=/home/lcr10rampage/claude-watch/server/.env
+Environment=PATH=/home/lcr10rampage/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/python3 /home/lcr10rampage/claude-watch/server/server.py
+Restart=always
+RestartSec=5
 
 [Install]
 WantedBy=multi-user.target

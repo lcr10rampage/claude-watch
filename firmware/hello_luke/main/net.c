@@ -9,6 +9,7 @@
 #include "esp_netif.h"
 #include "nvs_flash.h"
 #include "esp_http_client.h"
+#include "esp_crt_bundle.h"
 #include "cJSON.h"
 #include "net.h"
 #include "secrets.h"
@@ -18,6 +19,29 @@ static const char *TAG = "net";
 static EventGroupHandle_t s_ev;
 #define CONNECTED_BIT BIT0
 static int s_retry_delay_ms = 1000;
+
+/* Known networks, tried in order. After two failed attempts on one, move to the next. */
+typedef struct { const char *ssid, *pass; } wifi_cred_t;
+static const wifi_cred_t s_nets[] = {
+    { WIFI_SSID, WIFI_PASS },
+#ifdef WIFI_SSID2
+    { WIFI_SSID2, WIFI_PASS2 },
+#endif
+#ifdef WIFI_SSID3
+    { WIFI_SSID3, WIFI_PASS3 },
+#endif
+};
+#define N_NETS (sizeof(s_nets) / sizeof(s_nets[0]))
+static int s_net = 0, s_fails = 0;
+
+static void apply_net(int i)
+{
+    wifi_config_t wc = { 0 };
+    strlcpy((char *)wc.sta.ssid, s_nets[i].ssid, sizeof(wc.sta.ssid));
+    strlcpy((char *)wc.sta.password, s_nets[i].pass, sizeof(wc.sta.password));
+    wc.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+    esp_wifi_set_config(WIFI_IF_STA, &wc);
+}
 
 static void wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
@@ -29,11 +53,18 @@ static void wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data)
                  ((wifi_event_sta_disconnected_t *)data)->reason, s_retry_delay_ms);
         vTaskDelay(pdMS_TO_TICKS(s_retry_delay_ms));
         if (s_retry_delay_ms < 30000) s_retry_delay_ms *= 2;
+        if (++s_fails >= 2 && N_NETS > 1) {
+            s_fails = 0;
+            s_net = (s_net + 1) % N_NETS;
+            apply_net(s_net);
+            ESP_LOGI(TAG, "switching to network %d: %s", s_net, s_nets[s_net].ssid);
+        }
         esp_wifi_connect();
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *e = (ip_event_got_ip_t *)data;
         ESP_LOGI(TAG, "Wi-Fi connected, ip " IPSTR, IP2STR(&e->ip_info.ip));
         s_retry_delay_ms = 1000;
+        s_fails = 0;
         xEventGroupSetBits(s_ev, CONNECTED_BIT);
     }
 }
@@ -65,16 +96,45 @@ void net_init(void)
     esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event, NULL);
     esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_event, NULL);
 
-    wifi_config_t wc = { 0 };
-    strlcpy((char *)wc.sta.ssid, WIFI_SSID, sizeof(wc.sta.ssid));
-    strlcpy((char *)wc.sta.password, WIFI_PASS, sizeof(wc.sta.password));
-    wc.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
     esp_wifi_set_mode(WIFI_MODE_STA);
-    esp_wifi_set_config(WIFI_IF_STA, &wc);
+    apply_net(s_net);
     esp_wifi_set_ps(WIFI_PS_NONE);        /* power save made the link too laggy for TCP; revisit for battery */
     err = esp_wifi_start();
-    ESP_LOGI(TAG, "Wi-Fi start: %s, ssid %s; internal free now %u",
-             esp_err_to_name(err), WIFI_SSID, (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+    ESP_LOGI(TAG, "Wi-Fi start: %s, %u known networks, first %s; internal free now %u",
+             esp_err_to_name(err), (unsigned)N_NETS, s_nets[0].ssid, (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+}
+
+/* Serial test hook: drop the current network and try the next known one. */
+void net_next(void)
+{
+    if (N_NETS < 2) return;
+    s_net = (s_net + 1) % N_NETS;
+    s_fails = -1;            /* the forced disconnect below must not count as a failure */
+    s_retry_delay_ms = 1000;
+    apply_net(s_net);
+    ESP_LOGI(TAG, "NEXTNET: switching to network %d: %s", s_net, s_nets[s_net].ssid);
+    esp_wifi_disconnect();   /* the disconnect handler reconnects with the new config */
+}
+
+/* Serial test hook: blocking scan, print what the radio can see. */
+void net_scan(void (*emit)(const char *))
+{
+    wifi_scan_config_t sc = { .show_hidden = true };
+    esp_err_t err = esp_wifi_scan_start(&sc, true);
+    uint16_t n = 12;
+    wifi_ap_record_t recs[12];
+    char line[96];
+    if (err != ESP_OK || esp_wifi_scan_get_ap_records(&n, recs) != ESP_OK) {
+        snprintf(line, sizeof(line), "SCAN failed: %s\n", esp_err_to_name(err));
+        emit(line);
+        return;
+    }
+    for (int i = 0; i < n; i++) {
+        snprintf(line, sizeof(line), "SCAN %-32s ch%-2d %4d dBm auth %d\n", (char *)recs[i].ssid, recs[i].primary, recs[i].rssi, recs[i].authmode);
+        emit(line);
+    }
+    snprintf(line, sizeof(line), "SCAN done, %u networks\n", (unsigned)n);
+    emit(line);
 }
 
 bool net_connected(void)
@@ -125,6 +185,7 @@ static esp_err_t request(const char *path, esp_http_client_method_t method, cons
         .url = url,
         .method = method,
         .timeout_ms = timeout_ms,
+        .crt_bundle_attach = esp_crt_bundle_attach, /* trust public CAs for the https tunnel */
         .event_handler = http_event,
         .user_data = body,
     };

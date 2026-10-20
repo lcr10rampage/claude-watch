@@ -292,6 +292,11 @@ static void console_handle_line(char *line)
     } else if (strncmp(line, "BOOT", 4) == 0) {
         claude_button();
         console_reply("OK boot\n");
+    } else if (strncmp(line, "SCAN", 4) == 0) {
+        net_scan(console_reply);
+    } else if (strncmp(line, "NEXTNET", 7) == 0) {
+        net_next();
+        console_reply("OK switching network\n");
     } else if (strncmp(line, "WIFI", 4) == 0) {
         char out[96], ip[20];
         net_ip(ip, sizeof(ip));
@@ -379,6 +384,9 @@ static void console_task(void *arg)
 static lv_obj_t *s_time_label;
 static lv_obj_t *s_ampm_label;
 static lv_obj_t *s_date_label;
+static lv_obj_t *s_batt_label;          /* CLOCK face: live battery line */
+static volatile int  s_batt_pct = -1, s_batt_mv = 0;
+static volatile char s_batt_state = 0;  /* C charging, D discharging, S standby, 0 unknown */
 
 /* ---------------------------------------------------------------------- */
 /* Power modes                                                            */
@@ -894,6 +902,15 @@ static void clock_tick(lv_timer_t *timer)
         lv_label_set_text(s_ampm_label, ampm);
         strftime(buf, sizeof(buf), "%A, %b %d %Y", &t);
         lv_label_set_text(s_date_label, buf);
+        if (s_batt_pct < 0) {
+            lv_label_set_text(s_batt_label, "Battery --");
+        } else {
+            snprintf(buf, sizeof(buf), "%s %d%%  %d.%02d V", s_batt_state == 'C' ? LV_SYMBOL_CHARGE : LV_SYMBOL_BATTERY_FULL,
+                     s_batt_pct, s_batt_mv / 1000, (s_batt_mv % 1000) / 10);
+            lv_label_set_text(s_batt_label, buf);
+        }
+        lv_obj_set_style_text_color(s_batt_label,
+            s_batt_state == 'C' ? lv_color_hex(0x81C784) : s_batt_pct >= 0 && s_batt_pct <= 15 ? lv_color_hex(0xEF5350) : lv_color_hex(0xB0BEC5), 0);
     } else {
         snprintf(buf, sizeof(buf), "%d:%02d %s", hour12, t.tm_min, ampm);
         lv_label_set_text(s_time_label, buf);
@@ -1114,7 +1131,7 @@ static void face_set(face_t face)
     lv_anim_start(&a);
 
     if (PIC_COUNT > 0) {
-        if (home) photo_pick_random();      /* a fresh random picture every time home opens */
+        /* photo stays; a fresh one is picked only on wake (face_reset_instant) */
         fade(s_photo, home);
     } else {
         lv_anim_init(&a);
@@ -1128,6 +1145,7 @@ static void face_set(face_t face)
     fade(s_hello_label, !home);
     fade(s_date_label,  !home);
     fade(s_ampm_label,  !home);
+    fade(s_batt_label,  !home);
 }
 
 /* Jump straight to the photo face with a fresh picture, no animation (used while dark). */
@@ -1137,6 +1155,7 @@ static void face_reset_instant(void)
     lv_anim_delete(s_hello_label, NULL);
     lv_anim_delete(s_date_label, NULL);
     lv_anim_delete(s_ampm_label, NULL);
+    lv_anim_delete(s_batt_label, NULL);
     lv_anim_delete(s_photo, NULL);
     lv_anim_delete(s_sw_panel, NULL);
     lv_anim_delete(lv_screen_active(), NULL);
@@ -1152,7 +1171,7 @@ static void face_reset_instant(void)
     lv_obj_set_x(s_sw_panel, SCREEN_W);
     lv_obj_add_flag(s_sw_panel, LV_OBJ_FLAG_HIDDEN);
 
-    lv_obj_t *hide[] = { s_hello_label, s_date_label, s_ampm_label };
+    lv_obj_t *hide[] = { s_hello_label, s_date_label, s_ampm_label, s_batt_label };
     for (size_t i = 0; i < sizeof(hide) / sizeof(hide[0]); i++) {
         lv_obj_add_flag(hide[i], LV_OBJ_FLAG_HIDDEN);
         lv_obj_set_style_opa(hide[i], 0, 0);
@@ -1448,6 +1467,12 @@ static void build_ui(void)
     lv_obj_set_style_text_color(s_date_label, lv_color_hex(0xB0BEC5), 0);
     lv_obj_align(s_date_label, LV_ALIGN_CENTER, 0, 80);
 
+    s_batt_label = lv_label_create(scr);
+    lv_obj_set_style_text_font(s_batt_label, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(s_batt_label, lv_color_hex(0xB0BEC5), 0);
+    lv_label_set_text(s_batt_label, "Battery --");
+    lv_obj_align(s_batt_label, LV_ALIGN_CENTER, 0, 125);
+
     s_clock_timer = lv_timer_create(clock_tick, 250, NULL);
     sw_build(scr);
 
@@ -1466,6 +1491,7 @@ static void battery_task(void *arg)
     for (;;) {
         int mv, pct; char st;
         if (pmu_read(&mv, &pct, &st)) {
+            s_batt_pct = pct; s_batt_mv = mv; s_batt_state = st;   /* read by clock_tick on the CLOCK face */
             int64_t now = esp_timer_get_time();
             if (st != last_state) {
                 evlog_add('P', st, pct);
@@ -1477,7 +1503,7 @@ static void battery_task(void *arg)
                 last_log_us = now;
             }
         }
-        vTaskDelay(pdMS_TO_TICKS(10000));
+        vTaskDelay(pdMS_TO_TICKS(3000));
     }
 }
 

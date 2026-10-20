@@ -7,9 +7,11 @@ ESP-IDF firmware for the Waveshare ESP32-S3-Touch-AMOLED-2.06.
 What it does today:
 
 - **Photo face** (boot default): a random one of the pictures from
-  `attachments.zip`, with the time (no seconds) tucked at the top.
+  `attachments.zip`, with the time (no seconds) tucked at the top. The picture
+  changes only when the screen wakes from off, not when you visit other faces.
 - **Tap the time** → black **clock face**: "Hello Luke", time with seconds,
-  AM/PM, date. Tap the time again to go back.
+  AM/PM, date, and a live battery line (percent + volts, refreshed every 3 s;
+  green while charging, red at 15 % or below). Tap the time again to go back.
 - **Drag right-to-left** on the photo face → **stopwatch** (full-screen black
   sheet, Start/Stop + Reset). Drag left-to-right to close it.
 - **Double-tap the bottom-right corner** (right 40 % × bottom 30 % of the
@@ -21,9 +23,14 @@ What it does today:
   one → the ring pulses while the Pi asks Claude → the answer appears in a box
   on an orange screen. Tap the answer or press BOOT to close; BOOT also closes
   the menu. (Voice input is step 3; `ASK <text>` over serial sends any question.)
-- **Wi-Fi**: joins at boot and reconnects on its own. Credentials, the Pi's
-  address and the server token live in `main/secrets.h` (git-ignored; copy
-  `secrets.h.example`). Wi-Fi power save is off for link reliability.
+- **Wi-Fi**: joins at boot and reconnects on its own. `main/secrets.h`
+  (git-ignored; copy `secrets.h.example`) holds a list of known networks
+  (home Wi-Fi first, then e.g. a phone hotspot); after two failed attempts on
+  one the watch moves to the next. Wi-Fi power save is off for link reliability.
+- **Works anywhere**: the server address is the Pi's public Tailscale Funnel
+  URL (`https://<pi>.<tailnet>.ts.net`, see `../README.md`), so the watch
+  reaches Claude from any Wi-Fi or a phone hotspot. HTTPS uses the built-in
+  certificate bundle; mbedTLS buffers live in PSRAM (`sdkconfig.defaults`).
 - **Sleep mode**: when the screen is off the CPU drops to 80 MHz and light-sleeps
   between events, LVGL timers pause, touch polls slower, the IMU task is
   suspended. Light sleep is automatically disabled while USB is connected.
@@ -51,11 +58,17 @@ produced lines and colour distortion; double buffering fixed it. Plus in
 (`xTaskCreateWithCaps`), `SPIRAM_MALLOC_ALWAYSINTERNAL=2048`. Result: ~100 KB
 internal free with everything running (`HEAP` over serial).
 
-### Network gotcha
+### Network gotchas
 
-The router bridges its 2.4 GHz and 5 GHz radios badly. The watch is 2.4 GHz
-only; the Pi must be on 2.4 GHz too or they can't reach each other:
-`nmcli connection modify <profile> 802-11-wireless.band bg`.
+- The watch is 2.4 GHz only. An iPhone hotspot needs **Maximize Compatibility**
+  on, and iOS stops advertising the hotspot ~90 s after you leave the Personal
+  Hotspot screen if nothing is connected: open that screen, let the watch join,
+  then it stays alive. iOS broadcasts a curly apostrophe in "Luke’s iPhone";
+  the SSID in `secrets.h` must match byte for byte (`SCAN` shows what the watch sees).
+- Since traffic goes through the Funnel, the Pi's band no longer matters. If you
+  ever go back to a LAN address: the old router bridged its 2.4 GHz and 5 GHz
+  radios badly and the Pi had to be locked to 2.4 GHz
+  (`nmcli connection modify <profile> 802-11-wireless.band bg`).
 
 ### Build & flash (on the Pi)
 
@@ -83,6 +96,7 @@ Stop any serial listener before flashing; the port cannot be shared.
 `SETTIME YYYY-MM-DD HH:MM:SS`, `GETTIME`, `TIMETAP` (photo ↔ clock face),
 `SWIPE LEFT|RIGHT` (stopwatch in/out), `DTAP` (toggle screen), `BOOT` (Claude
 menu), `ASK <question>`, `WIFI` (ip, rssi, server reachable), `HEAP`, `BATT`,
+`SCAN` (list visible networks), `NEXTNET` (drop to the next known network),
 `DUMP` (on-device event log), `LOG ON|OFF` (verbose touch/accelerometer logging).
 
 ### Helper scripts (`tools/`, run with the ESP-IDF venv's python for pyserial)

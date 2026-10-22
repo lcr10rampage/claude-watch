@@ -118,6 +118,25 @@ Funnel and tailscaled restart on boot by themselves. Put the URL in the
 watch's `main/secrets.h` as `WATCH_SERVER_URL`; the `X-Watch-Token` header is
 the only thing guarding the endpoint, so keep the token long and private.
 
+## Calendar on the watch (`/calendar-refresh`)
+
+The watch shows your Google Calendar week by week, but it never talks to
+Google itself. You refresh it by hand: plug the watch into the Pi and run
+`/calendar-refresh` in Claude Code. The skill (`skills/calendar-refresh.md`,
+installed at `~/.claude/skills/calendar-refresh/SKILL.md`) does this:
+
+1. `tools/push_calendar.py --weeks` prints the Sunday-start weeks of this
+   month and next.
+2. Claude fetches each week with the claude.ai Google Calendar connector
+   (read-only) and writes the compact `data/calendar/events.json` (git-ignored).
+3. `tools/push_calendar.py` converts each week to text lines
+   (`D <date> <Day, Mon d>` / `E <start time>|<title>`), wipes the watch's
+   calendar slots over USB serial and uploads the new set. About one second.
+
+Because every refresh stores this month plus next, and the watch lists the
+current month's weeks, old weeks drop off and new ones appear on their own.
+Edit `week_lines()` in `tools/push_calendar.py` to change what a row shows.
+
 ## Adding a new API
 
 1. Add a function to `tools/watch_tools.py` (copy the template at the bottom).

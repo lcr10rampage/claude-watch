@@ -14,6 +14,14 @@ What it does today:
   green while charging, red at 15 % or below). Tap the time again to go back.
 - **Drag right-to-left** on the photo face → **stopwatch** (full-screen black
   sheet, Start/Stop + Reset). Drag left-to-right to close it.
+- **Swipe down** on the photo face → **calendar**: a panel slides in listing
+  this month's Sunday-to-Saturday weeks (current week blue). Tap a week for a
+  scrollable day-by-day list: big day headers (today blue), a rule between
+  days, one row per event with the start time in a grey column. The `<` button
+  goes back; swipe up on the week list closes the panel. Weeks live in flash
+  (`main/calstore.c`: twelve 16 KB raw slots at the start of the otherwise
+  unused `storage` partition) and are loaded over USB by the Pi's
+  `/calendar-refresh` skill, see `../README.md`. Nothing is fetched by the watch.
 - **Double-tap the bottom-right corner** (right 40 % × bottom 30 % of the
   glass, taps ≤ 500 ms apart) → screen off; same again → screen on. Works on
   every face and while the screen is dark. Waking always lands on the photo
@@ -97,6 +105,8 @@ Stop any serial listener before flashing; the port cannot be shared.
 `SWIPE LEFT|RIGHT` (stopwatch in/out), `DTAP` (toggle screen), `BOOT` (Claude
 menu), `ASK <question>`, `WIFI` (ip, rssi, server reachable), `HEAP`, `BATT`,
 `SCAN` (list visible networks), `NEXTNET` (drop to the next known network),
+`SWIPE DOWN|UP` (calendar in/out), `CALOPEN n` (open week n), calendar upload
+`CALCLEAR`, `CALBEGIN YYYY-MM-DD`, `CALADD <line>`, `CALEND`, `CALLIST`,
 `DUMP` (on-device event log), `LOG ON|OFF` (verbose touch/accelerometer logging).
 
 ### Helper scripts (`tools/`, run with the ESP-IDF venv's python for pyserial)

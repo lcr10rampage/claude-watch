@@ -7,6 +7,7 @@
  */
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 #include <time.h>
 #include <sys/time.h>
 #include <math.h>
@@ -24,6 +25,7 @@
 #include "esp_sleep.h"
 #include "esp_attr.h"
 #include "driver/usb_serial_jtag.h"
+#include "calstore.h"
 #include "esp_timer.h"
 #include "esp_random.h"
 #include "qmi8658.h"
@@ -35,9 +37,13 @@
 
 static const char *TAG = "hello_luke";
 #define ENABLE_NET 1   /* 1 = join Wi-Fi at boot and talk to the Pi (needs main/secrets.h) */
-typedef enum { FACE_CLOCK = 0, FACE_HOME, FACE_STOPWATCH } face_t;
+typedef enum { FACE_CLOCK = 0, FACE_HOME, FACE_STOPWATCH, FACE_CALENDAR } face_t;
 static face_t s_face;
 static void face_set(face_t face);
+static void cal_upload_begin(const char *start);
+static void cal_open_week(int i);
+static bool cal_upload_add(const char *text);
+static esp_err_t cal_upload_end(void);
 static void face_toggle(void);
 static void face_reset_instant(void);
 static void screen_set(bool on);
@@ -284,7 +290,7 @@ static void console_handle_line(char *line)
                  t.tm_hour, t.tm_min, t.tm_sec);
         console_reply(out);
     } else if (strncmp(line, "TIMETAP", 7) == 0) {
-        if (bsp_display_lock(100)) { if (s_face != FACE_STOPWATCH) face_toggle(); bsp_display_unlock(); }
+        if (bsp_display_lock(100)) { if (s_face != FACE_STOPWATCH && s_face != FACE_CALENDAR) face_toggle(); bsp_display_unlock(); }
         console_reply("OK timetap\n");
     } else if (strncmp(line, "ASK ", 4) == 0) {
         if (bsp_display_lock(200)) { if (!s_screen_on) screen_set(true); claude_ask(line + 4); bsp_display_unlock(); }
@@ -332,12 +338,35 @@ static void console_handle_line(char *line)
     } else if (strncmp(line, "DTAP", 4) == 0) {
         if (bsp_display_lock(100)) { screen_set(!s_screen_on); bsp_display_unlock(); }
         console_reply("OK dtap\n");
+    } else if (strncmp(line, "CALBEGIN ", 9) == 0) {
+        cal_upload_begin(line + 9);
+        console_reply("OK calbegin\n");
+    } else if (strncmp(line, "CALADD ", 7) == 0) {
+        console_reply(cal_upload_add(line + 7) ? "OK\n" : "ERR full\n");
+    } else if (strncmp(line, "CALEND", 6) == 0) {
+        esp_err_t err = cal_upload_end();
+        char out[64];
+        snprintf(out, sizeof(out), "%s calend %s\n", err == ESP_OK ? "OK" : "ERR", esp_err_to_name(err));
+        console_reply(out);
+    } else if (strncmp(line, "CALOPEN ", 8) == 0) {          /* test hook: open week N of the calendar face */
+        if (bsp_display_lock(200)) { if (s_face != FACE_CALENDAR) face_set(FACE_CALENDAR); cal_open_week(atoi(line + 8)); bsp_display_unlock(); }
+        console_reply("OK calopen\n");
+    } else if (strncmp(line, "CALLIST", 7) == 0) {
+        calstore_list(console_reply);
+    } else if (strncmp(line, "CALCLEAR", 8) == 0) {
+        console_reply(calstore_clear() == ESP_OK ? "OK calclear\n" : "ERR calclear\n");
     } else if (strncmp(line, "SWIPE LEFT", 10) == 0) {
         if (bsp_display_lock(100)) { if (s_face == FACE_HOME) face_set(FACE_STOPWATCH); bsp_display_unlock(); }
         console_reply("OK swipe left\n");
     } else if (strncmp(line, "SWIPE RIGHT", 11) == 0) {
         if (bsp_display_lock(100)) { if (s_face == FACE_STOPWATCH) face_set(FACE_HOME); bsp_display_unlock(); }
         console_reply("OK swipe right\n");
+    } else if (strncmp(line, "SWIPE DOWN", 10) == 0) {
+        if (bsp_display_lock(100)) { if (s_face == FACE_HOME) face_set(FACE_CALENDAR); bsp_display_unlock(); }
+        console_reply("OK swipe down\n");
+    } else if (strncmp(line, "SWIPE UP", 8) == 0) {
+        if (bsp_display_lock(100)) { if (s_face == FACE_CALENDAR) face_set(FACE_HOME); bsp_display_unlock(); }
+        console_reply("OK swipe up\n");
     } else if (strncmp(line, "TAP", 3) == 0) {
         if (bsp_display_lock(100)) { face_toggle(); bsp_display_unlock(); }
         console_reply("OK tap\n");
@@ -363,7 +392,7 @@ static void console_task(void *arg)
         vTaskDelete(NULL);
         return;
     }
-    char line[64];
+    static char line[320];        /* CALADD lines carry event titles */
     size_t len = 0;
     for (;;) {
         uint8_t c;
@@ -485,7 +514,7 @@ static void time_tap_cb(lv_event_t *e)
 {
     (void)e;
     if (!s_screen_on || touch_quiet()) return;
-    if (s_face == FACE_STOPWATCH) return;
+    if (s_face == FACE_STOPWATCH || s_face == FACE_CALENDAR) return;
     ESP_LOGI(TAG, "Time tapped");
     face_toggle();
 }
@@ -506,6 +535,14 @@ static void screen_gesture_cb(lv_event_t *e)
     case LV_DIR_RIGHT:
         ESP_LOGI(TAG, "Swipe right");
         if (s_face == FACE_STOPWATCH) face_set(FACE_HOME);
+        break;
+    case LV_DIR_BOTTOM:                    /* finger moves down: pull the calendar down over the photo */
+        ESP_LOGI(TAG, "Swipe down");
+        if (s_face == FACE_HOME) face_set(FACE_CALENDAR);
+        break;
+    case LV_DIR_TOP:                       /* finger moves up: push it back up */
+        ESP_LOGI(TAG, "Swipe up");
+        if (s_face == FACE_CALENDAR) face_set(FACE_HOME);
         break;
     default:
         break;
@@ -1101,6 +1138,321 @@ static void sw_slide(bool in)
 }
 
 /* ---------------------------------------------------------------------- */
+/* Calendar face: slides down from the top. Lists this month's weeks;      */
+/* tapping a week opens its view (phase 2 will show the picture there).   */
+/* ---------------------------------------------------------------------- */
+#define CAL_MAX_WEEKS 6
+#define CAL_COLOR     0x1E88E5
+typedef struct { time_t start; char label[40]; bool current; } cal_week_t;
+static cal_week_t s_cal_weeks[CAL_MAX_WEEKS];
+static int        s_cal_nweeks = 0;
+static lv_obj_t  *s_cal_panel, *s_cal_title, *s_cal_list, *s_cal_week_view, *s_cal_week_title, *s_cal_week_body;
+static lv_obj_t  *s_cal_days;              /* scrollable list of days inside the week view */
+static char      *s_cal_text;              /* PSRAM: one week's stored lines, or the upload in progress */
+static size_t     s_cal_text_len;
+static char       s_cal_upload_start[12];
+
+/* ---- serial upload (CALBEGIN <YYYY-MM-DD> / CALADD <line> / CALEND) ---- */
+static void cal_upload_begin(const char *start)
+{
+    if (!s_cal_text) s_cal_text = heap_caps_malloc(CALSTORE_MAX_TEXT + 1, MALLOC_CAP_SPIRAM);
+    strncpy(s_cal_upload_start, start, 10); s_cal_upload_start[10] = '\0';
+    s_cal_text_len = 0;
+    if (s_cal_text) s_cal_text[0] = '\0';
+}
+
+static bool cal_upload_add(const char *text)
+{
+    size_t n = strlen(text);
+    if (!s_cal_text || s_cal_text_len + n + 2 > CALSTORE_MAX_TEXT) return false;
+    memcpy(s_cal_text + s_cal_text_len, text, n);
+    s_cal_text_len += n;
+    s_cal_text[s_cal_text_len++] = '\n';
+    s_cal_text[s_cal_text_len] = '\0';
+    return true;
+}
+
+static esp_err_t cal_upload_end(void)
+{
+    if (!s_cal_text || s_cal_upload_start[0] == '\0') return ESP_ERR_INVALID_STATE;
+    esp_err_t err = calstore_write(s_cal_upload_start, s_cal_text, s_cal_text_len);
+    s_cal_upload_start[0] = '\0';
+    return err;
+}
+
+static lv_obj_t *cal_text(lv_obj_t *parent, const char *txt, const lv_font_t *font, uint32_t color, int pad_top)
+{
+    lv_obj_t *l = lv_label_create(parent);
+    lv_label_set_text(l, txt);
+    lv_label_set_long_mode(l, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(l, SCREEN_W - 44);
+    lv_obj_set_style_text_font(l, font, 0);
+    lv_obj_set_style_text_color(l, lv_color_hex(color), 0);
+    lv_obj_set_style_pad_top(l, pad_top, 0);
+    return l;
+}
+
+/* Fill the week view from the stored lines:
+     D <YYYY-MM-DD> <Day, Mon d>      day header (blue if today)
+     E <time text>|<title>            one event
+   A day header with no E lines after it shows "Nothing". */
+static void cal_week_render(const char *start)
+{
+    lv_obj_clean(s_cal_days);
+    if (!s_cal_text) s_cal_text = heap_caps_malloc(CALSTORE_MAX_TEXT + 1, MALLOC_CAP_SPIRAM);
+    size_t n = s_cal_text ? calstore_read(start, s_cal_text, CALSTORE_MAX_TEXT + 1) : 0;
+    if (n == 0) {
+        cal_text(s_cal_days, "Not loaded yet.\n\nPlug the watch in and run\n/calendar-refresh on the Pi.", &lv_font_montserrat_20, 0xB0BEC5, 40);
+        lv_obj_set_style_text_align(lv_obj_get_child(s_cal_days, 0), LV_TEXT_ALIGN_CENTER, 0);
+        return;
+    }
+    char today[12];
+    time_t now = time(NULL); struct tm t; localtime_r(&now, &t);
+    strftime(today, sizeof(today), "%Y-%m-%d", &t);
+
+    bool day_open = false, day_has_event = false;
+    char *p = s_cal_text;
+    while (p && *p) {
+        char *nl = strchr(p, '\n');
+        if (nl) *nl = '\0';
+        if (p[0] == 'D' && p[1] == ' ' && strlen(p) > 13) {
+            if (day_open && !day_has_event) cal_text(s_cal_days, "Nothing", &lv_font_montserrat_20, 0x546E7A, 4);
+            if (day_open) {                                   /* thin rule between days */
+                lv_obj_t *rule = lv_obj_create(s_cal_days);
+                lv_obj_set_size(rule, SCREEN_W - 44, 2);
+                lv_obj_set_style_bg_color(rule, lv_color_hex(0x37474F), 0);
+                lv_obj_set_style_bg_opa(rule, LV_OPA_COVER, 0);
+                lv_obj_set_style_border_width(rule, 0, 0);
+                lv_obj_set_style_radius(rule, 0, 0);
+                lv_obj_set_style_margin_top(rule, 30, 0);
+                lv_obj_set_style_margin_bottom(rule, 14, 0);
+            }
+            bool is_today = strncmp(p + 2, today, 10) == 0;
+            cal_text(s_cal_days, p + 13, &lv_font_montserrat_28, is_today ? 0x64B5F6 : 0xFFFFFF, 2);
+            day_open = true; day_has_event = false;
+        } else if (p[0] == 'E' && p[1] == ' ') {
+            char *bar = strchr(p + 2, '|');
+            const char *when = p + 2, *what = p + 2;
+            if (bar) { *bar = '\0'; what = bar + 1; } else when = "";
+            lv_obj_t *row = lv_obj_create(s_cal_days);            /* [time 100px][title, wraps] */
+            lv_obj_set_width(row, SCREEN_W - 44);
+            lv_obj_set_height(row, LV_SIZE_CONTENT);
+            lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
+            lv_obj_set_style_border_width(row, 0, 0);
+            lv_obj_set_style_pad_all(row, 0, 0);
+            lv_obj_set_style_pad_top(row, 6, 0);
+            lv_obj_set_style_pad_column(row, 8, 0);
+            lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+            lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+            lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+            lv_obj_t *tl = cal_text(row, when, &lv_font_montserrat_20, 0x90A4AE, 0);
+            lv_obj_set_width(tl, 100);
+            lv_obj_t *wl = cal_text(row, what, &lv_font_montserrat_20, 0xECEFF1, 0);
+            lv_obj_set_width(wl, SCREEN_W - 44 - 108);
+            day_has_event = true;
+        }
+        p = nl ? nl + 1 : NULL;
+    }
+    if (day_open && !day_has_event) cal_text(s_cal_days, "Nothing", &lv_font_montserrat_20, 0x546E7A, 4);
+    cal_text(s_cal_days, "", &lv_font_montserrat_14, 0x000000, 24);   /* bottom breathing room */
+    lv_obj_scroll_to_y(s_cal_days, 0, LV_ANIM_OFF);
+}
+
+static void cal_show_list(void)
+{
+    lv_obj_add_flag(s_cal_week_view, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_remove_flag(s_cal_list, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_remove_flag(s_cal_title, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void cal_open_week(int i)
+{
+    if (i < 0 || i >= s_cal_nweeks) return;
+    ESP_LOGI(TAG, "Calendar week %d: %s", i, s_cal_weeks[i].label);
+    lv_label_set_text(s_cal_week_title, s_cal_weeks[i].label);
+    struct tm ts; localtime_r(&s_cal_weeks[i].start, &ts);
+    char start[12]; strftime(start, sizeof(start), "%Y-%m-%d", &ts);
+    cal_week_render(start);
+    lv_obj_add_flag(s_cal_list, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(s_cal_title, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_remove_flag(s_cal_week_view, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void cal_week_cb(lv_event_t *e)
+{
+    if (!s_screen_on || touch_quiet()) return;
+    cal_open_week((int)(intptr_t)lv_event_get_user_data(e));
+}
+
+static void cal_back_cb(lv_event_t *e)
+{
+    (void)e;
+    if (!s_screen_on || touch_quiet()) return;
+    cal_show_list();
+    lv_obj_clean(s_cal_days);
+}
+
+static const char *s_mon[] = { "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+
+/* Rebuild the week buttons for the month that contains today. Weeks run Sunday to Saturday. */
+static void cal_build_weeks(void)
+{
+    lv_obj_clean(s_cal_list);
+    time_t now = time(NULL);
+    struct tm t; localtime_r(&now, &t);
+    int month = t.tm_mon, year = t.tm_year;
+
+    char title[32];
+    snprintf(title, sizeof(title), "%s %d", s_mon[month], year + 1900);
+    lv_label_set_text(s_cal_title, title);
+
+    /* Sunday on or before the 1st */
+    struct tm d = t; d.tm_mday = 1; d.tm_hour = 12; d.tm_min = d.tm_sec = 0; d.tm_isdst = -1;
+    time_t cur = mktime(&d);
+    localtime_r(&cur, &d);
+    cur -= (time_t)d.tm_wday * 86400;
+
+    s_cal_nweeks = 0;
+    for (int w = 0; w < CAL_MAX_WEEKS; w++) {
+        struct tm a, b;
+        localtime_r(&cur, &a);
+        time_t end = cur + 6 * 86400;
+        localtime_r(&end, &b);
+        if (a.tm_mon != month && (a.tm_year > year || (a.tm_year == year && a.tm_mon > month))) break; /* past the month */
+        cal_week_t *wk = &s_cal_weeks[s_cal_nweeks];
+        wk->start = cur;
+        wk->current = (now >= cur && now < end + 86400);
+        if (a.tm_mon == b.tm_mon)
+            snprintf(wk->label, sizeof(wk->label), "%s %d - %d", s_mon[a.tm_mon], a.tm_mday, b.tm_mday);
+        else
+            snprintf(wk->label, sizeof(wk->label), "%s %d - %s %d", s_mon[a.tm_mon], a.tm_mday, s_mon[b.tm_mon], b.tm_mday);
+
+        lv_obj_t *btn = lv_button_create(s_cal_list);
+        lv_obj_set_size(btn, 320, 54);
+        lv_obj_set_style_bg_color(btn, lv_color_hex(wk->current ? CAL_COLOR : 0x263238), 0);
+        lv_obj_set_style_radius(btn, 27, 0);
+        lv_obj_set_style_shadow_width(btn, 0, 0);
+        lv_obj_set_style_border_width(btn, wk->current ? 0 : 1, 0);
+        lv_obj_set_style_border_color(btn, lv_color_hex(0x455A64), 0);
+        lv_obj_add_flag(btn, LV_OBJ_FLAG_GESTURE_BUBBLE);
+        lv_obj_add_event_cb(btn, cal_week_cb, LV_EVENT_CLICKED, (void *)(intptr_t)s_cal_nweeks);
+        lv_obj_add_event_cb(btn, screen_tap_cb, LV_EVENT_CLICKED, NULL);   /* corner double-tap still turns the screen off */
+        lv_obj_t *lbl = lv_label_create(btn);
+        lv_label_set_text(lbl, wk->label);
+        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_20, 0);
+        lv_obj_set_style_text_color(lbl, lv_color_white(), 0);
+        lv_obj_center(lbl);
+        s_cal_nweeks++;
+        cur = end + 86400;
+    }
+}
+
+static void cal_build(lv_obj_t *scr)
+{
+    s_cal_panel = lv_obj_create(scr);
+    lv_obj_set_size(s_cal_panel, SCREEN_W, SCREEN_H);
+    lv_obj_set_pos(s_cal_panel, 0, -SCREEN_H);
+    lv_obj_set_style_bg_color(s_cal_panel, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(s_cal_panel, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(s_cal_panel, 0, 0);
+    lv_obj_set_style_border_width(s_cal_panel, 0, 0);
+    lv_obj_set_style_pad_all(s_cal_panel, 0, 0);
+    lv_obj_remove_flag(s_cal_panel, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(s_cal_panel, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(s_cal_panel, LV_OBJ_FLAG_GESTURE_BUBBLE);
+    lv_obj_add_event_cb(s_cal_panel, screen_tap_cb, LV_EVENT_CLICKED, NULL);
+
+    s_cal_title = lv_label_create(s_cal_panel);
+    lv_obj_set_style_text_font(s_cal_title, &lv_font_montserrat_28, 0);
+    lv_obj_set_style_text_color(s_cal_title, lv_color_hex(0x64B5F6), 0);
+    lv_obj_align(s_cal_title, LV_ALIGN_TOP_MID, 0, 36);
+
+    s_cal_list = lv_obj_create(s_cal_panel);
+    lv_obj_set_size(s_cal_list, SCREEN_W, SCREEN_H - 90);
+    lv_obj_set_pos(s_cal_list, 0, 90);
+    lv_obj_set_style_bg_opa(s_cal_list, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(s_cal_list, 0, 0);
+    lv_obj_set_style_pad_all(s_cal_list, 0, 0);
+    lv_obj_set_style_pad_row(s_cal_list, 12, 0);
+    lv_obj_set_flex_flow(s_cal_list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(s_cal_list, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_remove_flag(s_cal_list, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(s_cal_list, LV_OBJ_FLAG_GESTURE_BUBBLE);
+
+    s_cal_week_view = lv_obj_create(s_cal_panel);
+    lv_obj_set_size(s_cal_week_view, SCREEN_W, SCREEN_H);
+    lv_obj_set_pos(s_cal_week_view, 0, 0);
+    lv_obj_set_style_bg_color(s_cal_week_view, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(s_cal_week_view, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(s_cal_week_view, 0, 0);
+    lv_obj_set_style_border_width(s_cal_week_view, 0, 0);
+    lv_obj_set_style_pad_all(s_cal_week_view, 0, 0);
+    lv_obj_remove_flag(s_cal_week_view, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(s_cal_week_view, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(s_cal_week_view, LV_OBJ_FLAG_GESTURE_BUBBLE);
+    lv_obj_add_event_cb(s_cal_week_view, screen_tap_cb, LV_EVENT_CLICKED, NULL);
+
+    s_cal_week_title = lv_label_create(s_cal_week_view);
+    lv_obj_set_style_text_font(s_cal_week_title, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(s_cal_week_title, lv_color_hex(0x64B5F6), 0);
+    lv_obj_align(s_cal_week_title, LV_ALIGN_TOP_MID, 24, 60);
+
+    lv_obj_t *back = lv_button_create(s_cal_week_view);      /* round "<" at the top-left */
+    lv_obj_set_size(back, 48, 48);
+    lv_obj_set_style_bg_color(back, lv_color_hex(0x37474F), 0);
+    lv_obj_set_style_radius(back, 24, 0);
+    lv_obj_set_style_shadow_width(back, 0, 0);
+    lv_obj_align(back, LV_ALIGN_TOP_LEFT, 36, 48);   /* clear of the rounded corner */
+    lv_obj_add_event_cb(back, cal_back_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *bl = lv_label_create(back);
+    lv_label_set_text(bl, LV_SYMBOL_LEFT);
+    lv_obj_set_style_text_color(bl, lv_color_white(), 0);
+    lv_obj_center(bl);
+
+    s_cal_days = lv_obj_create(s_cal_week_view);
+    lv_obj_set_size(s_cal_days, SCREEN_W, SCREEN_H - 108);
+    lv_obj_set_pos(s_cal_days, 0, 108);
+    lv_obj_set_style_bg_opa(s_cal_days, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(s_cal_days, 0, 0);
+    lv_obj_set_style_pad_hor(s_cal_days, 22, 0);
+    lv_obj_set_style_pad_ver(s_cal_days, 0, 0);
+    lv_obj_set_style_pad_row(s_cal_days, 0, 0);
+    lv_obj_set_flex_flow(s_cal_days, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_scroll_dir(s_cal_days, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(s_cal_days, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_remove_flag(s_cal_days, LV_OBJ_FLAG_GESTURE_BUBBLE);   /* scrolling here must not close the calendar */
+    (void)s_cal_week_body;
+
+    cal_build_weeks();
+    lv_obj_move_foreground(s_cal_panel);    /* above the time strip: the calendar needs the whole screen */
+}
+
+static void anim_y_cb(void *obj, int32_t v)
+{
+    lv_obj_set_y((lv_obj_t *)obj, v);
+}
+
+static void cal_slide(bool in)
+{
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, s_cal_panel);
+    lv_anim_set_exec_cb(&a, anim_y_cb);
+    lv_anim_set_duration(&a, FACE_ANIM_MS);
+    lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
+    if (in) {
+        cal_build_weeks();                   /* today may have moved on since the last look */
+        cal_show_list();
+        lv_obj_remove_flag(s_cal_panel, LV_OBJ_FLAG_HIDDEN);
+        lv_anim_set_values(&a, -SCREEN_H, 0);
+    } else {
+        lv_anim_set_values(&a, 0, -SCREEN_H);
+        lv_anim_set_completed_cb(&a, anim_hide_when_done);
+    }
+    lv_anim_start(&a);
+}
+
+/* ---------------------------------------------------------------------- */
 /* Face transitions                                                       */
 /* ---------------------------------------------------------------------- */
 static void face_set(face_t face)
@@ -1108,11 +1460,13 @@ static void face_set(face_t face)
     if (face == s_face) return;
     face_t prev = s_face;
     s_face = face;
-    ESP_LOGI(TAG, "Face -> %s", face == FACE_HOME ? "home" : face == FACE_STOPWATCH ? "stopwatch" : "clock");
+    ESP_LOGI(TAG, "Face -> %s", face == FACE_HOME ? "home" : face == FACE_STOPWATCH ? "stopwatch" : face == FACE_CALENDAR ? "calendar" : "clock");
 
-    /* Stopwatch panel slides over the home face; nothing else changes. */
+    /* Stopwatch and calendar panels slide over the home face; nothing else changes. */
     if (face == FACE_STOPWATCH) { sw_slide(true);  return; }
     if (prev == FACE_STOPWATCH) { sw_slide(false); return; }
+    if (face == FACE_CALENDAR)  { cal_slide(true);  return; }
+    if (prev == FACE_CALENDAR)  { cal_slide(false); return; }
 
     lv_obj_t *scr = lv_screen_active();
     bool home = (face == FACE_HOME);
@@ -1170,6 +1524,9 @@ static void face_reset_instant(void)
     }
     lv_obj_set_x(s_sw_panel, SCREEN_W);
     lv_obj_add_flag(s_sw_panel, LV_OBJ_FLAG_HIDDEN);
+    lv_anim_delete(s_cal_panel, NULL);
+    lv_obj_set_y(s_cal_panel, -SCREEN_H);
+    lv_obj_add_flag(s_cal_panel, LV_OBJ_FLAG_HIDDEN);
 
     lv_obj_t *hide[] = { s_hello_label, s_date_label, s_ampm_label, s_batt_label };
     for (size_t i = 0; i < sizeof(hide) / sizeof(hide[0]); i++) {
@@ -1475,6 +1832,7 @@ static void build_ui(void)
 
     s_clock_timer = lv_timer_create(clock_tick, 250, NULL);
     sw_build(scr);
+    cal_build(scr);
 
     claude_build(scr);
 
@@ -1520,6 +1878,7 @@ void app_main(void)
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
     bsp_display_start();
+    calstore_init();
     clock_setup();
 
     bsp_display_lock(0);

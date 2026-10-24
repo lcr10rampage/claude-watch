@@ -84,8 +84,15 @@ void calstore_list(void (*emit)(const char *))
     emit(line);
 }
 
+/* Erase every slot whose key looks like a date (calendar weeks); named slots such as "tasks" stay. */
 esp_err_t calstore_clear(void)
 {
     if (!s_part) return ESP_ERR_INVALID_STATE;
-    return esp_partition_erase_range(s_part, 0, (size_t)CALSTORE_SLOTS * CALSTORE_SLOT_SIZE);
+    cal_hdr_t h; esp_err_t err = ESP_OK;
+    for (int i = 0; i < CALSTORE_SLOTS; i++) {
+        if (!read_hdr(i, &h) || h.start[0] != '2') continue;
+        esp_err_t e = esp_partition_erase_range(s_part, (size_t)i * CALSTORE_SLOT_SIZE, CALSTORE_SLOT_SIZE);
+        if (e != ESP_OK) err = e;
+    }
+    return err;
 }

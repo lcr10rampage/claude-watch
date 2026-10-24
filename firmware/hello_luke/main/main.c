@@ -37,7 +37,7 @@
 
 static const char *TAG = "hello_luke";
 #define ENABLE_NET 1   /* 1 = join Wi-Fi at boot and talk to the Pi (needs main/secrets.h) */
-typedef enum { FACE_CLOCK = 0, FACE_HOME, FACE_STOPWATCH, FACE_CALENDAR } face_t;
+typedef enum { FACE_CLOCK = 0, FACE_HOME, FACE_STOPWATCH, FACE_CALENDAR, FACE_TASKS } face_t;
 static face_t s_face;
 static void face_set(face_t face);
 static void cal_upload_begin(const char *start);
@@ -290,7 +290,7 @@ static void console_handle_line(char *line)
                  t.tm_hour, t.tm_min, t.tm_sec);
         console_reply(out);
     } else if (strncmp(line, "TIMETAP", 7) == 0) {
-        if (bsp_display_lock(100)) { if (s_face != FACE_STOPWATCH && s_face != FACE_CALENDAR) face_toggle(); bsp_display_unlock(); }
+        if (bsp_display_lock(100)) { if (s_face != FACE_STOPWATCH && s_face != FACE_CALENDAR && s_face != FACE_TASKS) face_toggle(); bsp_display_unlock(); }
         console_reply("OK timetap\n");
     } else if (strncmp(line, "ASK ", 4) == 0) {
         if (bsp_display_lock(200)) { if (!s_screen_on) screen_set(true); claude_ask(line + 4); bsp_display_unlock(); }
@@ -362,10 +362,10 @@ static void console_handle_line(char *line)
         if (bsp_display_lock(100)) { if (s_face == FACE_STOPWATCH) face_set(FACE_HOME); bsp_display_unlock(); }
         console_reply("OK swipe right\n");
     } else if (strncmp(line, "SWIPE DOWN", 10) == 0) {
-        if (bsp_display_lock(100)) { if (s_face == FACE_HOME) face_set(FACE_CALENDAR); bsp_display_unlock(); }
+        if (bsp_display_lock(100)) { if (s_face == FACE_HOME) face_set(FACE_CALENDAR); else if (s_face == FACE_TASKS) face_set(FACE_HOME); bsp_display_unlock(); }
         console_reply("OK swipe down\n");
     } else if (strncmp(line, "SWIPE UP", 8) == 0) {
-        if (bsp_display_lock(100)) { if (s_face == FACE_CALENDAR) face_set(FACE_HOME); bsp_display_unlock(); }
+        if (bsp_display_lock(100)) { if (s_face == FACE_CALENDAR) face_set(FACE_HOME); else if (s_face == FACE_HOME) face_set(FACE_TASKS); bsp_display_unlock(); }
         console_reply("OK swipe up\n");
     } else if (strncmp(line, "TAP", 3) == 0) {
         if (bsp_display_lock(100)) { face_toggle(); bsp_display_unlock(); }
@@ -514,7 +514,7 @@ static void time_tap_cb(lv_event_t *e)
 {
     (void)e;
     if (!s_screen_on || touch_quiet()) return;
-    if (s_face == FACE_STOPWATCH || s_face == FACE_CALENDAR) return;
+    if (s_face == FACE_STOPWATCH || s_face == FACE_CALENDAR || s_face == FACE_TASKS) return;
     ESP_LOGI(TAG, "Time tapped");
     face_toggle();
 }
@@ -536,13 +536,15 @@ static void screen_gesture_cb(lv_event_t *e)
         ESP_LOGI(TAG, "Swipe right");
         if (s_face == FACE_STOPWATCH) face_set(FACE_HOME);
         break;
-    case LV_DIR_BOTTOM:                    /* finger moves down: pull the calendar down over the photo */
+    case LV_DIR_BOTTOM:                    /* finger moves down: calendar in, or tasks out */
         ESP_LOGI(TAG, "Swipe down");
         if (s_face == FACE_HOME) face_set(FACE_CALENDAR);
+        else if (s_face == FACE_TASKS) face_set(FACE_HOME);
         break;
-    case LV_DIR_TOP:                       /* finger moves up: push it back up */
+    case LV_DIR_TOP:                       /* finger moves up: calendar out, or tasks in */
         ESP_LOGI(TAG, "Swipe up");
         if (s_face == FACE_CALENDAR) face_set(FACE_HOME);
+        else if (s_face == FACE_HOME) face_set(FACE_TASKS);
         break;
     default:
         break;
@@ -1453,6 +1455,328 @@ static void cal_slide(bool in)
 }
 
 /* ---------------------------------------------------------------------- */
+/* Tasks face: slides up from the bottom. A checklist stored in flash      */
+/* under the key "tasks" (same slot store as the calendar):               */
+/*     T 0 Buy cat food        open                                       */
+/*     T 1 Finish essay        done                                       */
+/* Tapping a box toggles it and rewrites the slot. Loaded over USB with   */
+/* CALBEGIN tasks / CALADD T 0 <text> / CALEND; integration comes later.  */
+/* ---------------------------------------------------------------------- */
+#define TASKS_KEY   "tasks"
+#define TASKS_MAX   40
+#define TASKS_COLOR 0x43A047
+typedef struct { bool done; char text[96]; } task_t;
+static task_t    s_tasks[TASKS_MAX];
+static int       s_ntasks = 0;
+static lv_obj_t *s_tasks_panel, *s_tasks_title, *s_tasks_list, *s_tasks_count, *s_tasks_add_view;
+static const char *s_task_presets[] = { "Finish Homework", "Check Canvas", "Check on Cricket", "Check Calendar" };
+#define TASK_PRESETS (sizeof(s_task_presets) / sizeof(s_task_presets[0]))
+static char     *s_tasks_text;        /* PSRAM scratch for load/save */
+
+static void tasks_load(void)
+{
+    s_ntasks = 0;
+    if (!s_tasks_text) s_tasks_text = heap_caps_malloc(CALSTORE_MAX_TEXT + 1, MALLOC_CAP_SPIRAM);
+    if (!s_tasks_text || calstore_read(TASKS_KEY, s_tasks_text, CALSTORE_MAX_TEXT + 1) == 0) return;
+    char *p = s_tasks_text;
+    while (p && *p && s_ntasks < TASKS_MAX) {
+        char *nl = strchr(p, '\n');
+        if (nl) *nl = '\0';
+        if (p[0] == 'T' && p[1] == ' ' && (p[2] == '0' || p[2] == '1') && p[3] == ' ' && p[4]) {
+            s_tasks[s_ntasks].done = (p[2] == '1');
+            strlcpy(s_tasks[s_ntasks].text, p + 4, sizeof(s_tasks[s_ntasks].text));
+            s_ntasks++;
+        }
+        p = nl ? nl + 1 : NULL;
+    }
+}
+
+static void tasks_save(void)
+{
+    if (!s_tasks_text) return;
+    size_t len = 0;
+    for (int i = 0; i < s_ntasks; i++)
+        len += snprintf(s_tasks_text + len, CALSTORE_MAX_TEXT - len, "T %d %s\n", s_tasks[i].done ? 1 : 0, s_tasks[i].text);
+    calstore_write(TASKS_KEY, s_tasks_text, len);
+}
+
+static void tasks_update_count(void)
+{
+    int open = 0;
+    for (int i = 0; i < s_ntasks; i++) if (!s_tasks[i].done) open++;
+    char buf[40];
+    if (open == 0) snprintf(buf, sizeof(buf), " ");
+    else snprintf(buf, sizeof(buf), "%d to do", open);
+    lv_label_set_text(s_tasks_count, buf);
+}
+
+static void tasks_style_row(lv_obj_t *cb, bool done)
+{
+    lv_obj_set_style_text_color(cb, lv_color_hex(done ? 0x607D8B : 0xECEFF1), 0);
+    lv_obj_set_style_text_decor(cb, done ? LV_TEXT_DECOR_STRIKETHROUGH : LV_TEXT_DECOR_NONE, 0);
+}
+
+static void tasks_render(void);
+static lv_timer_t *s_tasks_purge_timer;
+
+/* A moment after a box is ticked, drop every done task from the list and flash. */
+static void tasks_purge_cb(lv_timer_t *t)
+{
+    (void)t;
+    s_tasks_purge_timer = NULL;
+    int n = 0;
+    for (int i = 0; i < s_ntasks; i++) if (!s_tasks[i].done) s_tasks[n++] = s_tasks[i];
+    if (n == s_ntasks) return;
+    s_ntasks = n;
+    tasks_save();
+    tasks_render();
+}
+
+static void tasks_toggle_cb(lv_event_t *e)
+{
+    if (!s_screen_on || touch_quiet()) return;
+    lv_obj_t *cb = lv_event_get_target(e);
+    int i = (int)(intptr_t)lv_event_get_user_data(e);
+    if (i < 0 || i >= s_ntasks) return;
+    s_tasks[i].done = lv_obj_has_state(cb, LV_STATE_CHECKED);
+    tasks_style_row(cb, s_tasks[i].done);
+    tasks_update_count();
+    ESP_LOGI(TAG, "Task %d %s: %s", i, s_tasks[i].done ? "done" : "open", s_tasks[i].text);
+    if (s_tasks[i].done) {
+        if (s_tasks_purge_timer) lv_timer_reset(s_tasks_purge_timer);
+        else { s_tasks_purge_timer = lv_timer_create(tasks_purge_cb, 700, NULL); lv_timer_set_repeat_count(s_tasks_purge_timer, 1); }
+    }
+}
+
+static void tasks_render(void)
+{
+    lv_obj_clean(s_tasks_list);
+    tasks_load();
+    int n = 0;                                   /* anything stored as done is gone */
+    for (int i = 0; i < s_ntasks; i++) if (!s_tasks[i].done) s_tasks[n++] = s_tasks[i];
+    if (n != s_ntasks) { s_ntasks = n; tasks_save(); }
+    tasks_update_count();
+    if (s_ntasks == 0) {
+        lv_obj_t *l = cal_text(s_tasks_list, "All clear.\n\nTap + to add a task.", &lv_font_montserrat_20, 0xB0BEC5, 40);
+        lv_obj_set_style_text_align(l, LV_TEXT_ALIGN_CENTER, 0);
+        return;
+    }
+    for (int i = 0; i < s_ntasks; i++) {
+        lv_obj_t *cb = lv_checkbox_create(s_tasks_list);
+        lv_checkbox_set_text(cb, s_tasks[i].text);
+        lv_obj_set_width(cb, SCREEN_W - 44);
+        lv_obj_set_style_text_font(cb, &lv_font_montserrat_20, 0);
+        lv_obj_set_style_pad_top(cb, 10, 0);
+        lv_obj_set_style_pad_bottom(cb, 10, 0);
+        lv_obj_set_style_pad_column(cb, 14, 0);
+        lv_obj_set_style_bg_color(cb, lv_color_hex(0x263238), LV_PART_INDICATOR);
+        lv_obj_set_style_border_color(cb, lv_color_hex(0x78909C), LV_PART_INDICATOR);
+        lv_obj_set_style_border_width(cb, 2, LV_PART_INDICATOR);
+        lv_obj_set_style_bg_color(cb, lv_color_hex(TASKS_COLOR), LV_PART_INDICATOR | LV_STATE_CHECKED);
+        lv_obj_set_style_border_color(cb, lv_color_hex(TASKS_COLOR), LV_PART_INDICATOR | LV_STATE_CHECKED);
+        lv_obj_set_style_radius(cb, 6, LV_PART_INDICATOR);
+        lv_obj_set_style_pad_all(cb, 6, LV_PART_INDICATOR);
+        if (s_tasks[i].done) lv_obj_add_state(cb, LV_STATE_CHECKED);
+        tasks_style_row(cb, s_tasks[i].done);
+        lv_obj_add_event_cb(cb, tasks_toggle_cb, LV_EVENT_VALUE_CHANGED, (void *)(intptr_t)i);
+    }
+    cal_text(s_tasks_list, "", &lv_font_montserrat_14, 0x000000, 20);
+    lv_obj_scroll_to_y(s_tasks_list, 0, LV_ANIM_OFF);
+}
+
+static void tasks_show_add(bool show)
+{
+    if (show) lv_obj_remove_flag(s_tasks_add_view, LV_OBJ_FLAG_HIDDEN);
+    else      lv_obj_add_flag(s_tasks_add_view, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void tasks_open_add_cb(lv_event_t *e)
+{
+    (void)e;
+    if (!s_screen_on || touch_quiet()) return;
+    tasks_show_add(true);
+}
+
+static void tasks_add_back_cb(lv_event_t *e)
+{
+    (void)e;
+    if (!s_screen_on || touch_quiet()) return;
+    tasks_show_add(false);
+}
+
+/* A preset button: append it as an open task (or reopen it if it is already there and done). */
+static void tasks_add_preset_cb(lv_event_t *e)
+{
+    if (!s_screen_on || touch_quiet()) return;
+    int k = (int)(intptr_t)lv_event_get_user_data(e);
+    if (k < 0 || k >= (int)TASK_PRESETS) return;
+    const char *text = s_task_presets[k];
+    int found = -1;
+    for (int i = 0; i < s_ntasks; i++) if (strcmp(s_tasks[i].text, text) == 0) { found = i; break; }
+    if (found >= 0) s_tasks[found].done = false;
+    else if (s_ntasks < TASKS_MAX) { s_tasks[s_ntasks].done = false; strlcpy(s_tasks[s_ntasks].text, text, sizeof(s_tasks[0].text)); s_ntasks++; }
+    else return;
+    tasks_save();
+    ESP_LOGI(TAG, "Task added: %s", text);
+    tasks_show_add(false);
+    tasks_render();
+}
+
+static void tasks_close_cb(lv_event_t *e)
+{
+    (void)e;
+    if (!s_screen_on || touch_quiet()) return;
+    if (s_face == FACE_TASKS) face_set(FACE_HOME);
+}
+
+static void tasks_build(lv_obj_t *scr)
+{
+    s_tasks_panel = lv_obj_create(scr);
+    lv_obj_set_size(s_tasks_panel, SCREEN_W, SCREEN_H);
+    lv_obj_set_pos(s_tasks_panel, 0, SCREEN_H);
+    lv_obj_set_style_bg_color(s_tasks_panel, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(s_tasks_panel, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(s_tasks_panel, 0, 0);
+    lv_obj_set_style_border_width(s_tasks_panel, 0, 0);
+    lv_obj_set_style_pad_all(s_tasks_panel, 0, 0);
+    lv_obj_remove_flag(s_tasks_panel, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(s_tasks_panel, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(s_tasks_panel, LV_OBJ_FLAG_GESTURE_BUBBLE);
+    lv_obj_add_event_cb(s_tasks_panel, screen_tap_cb, LV_EVENT_CLICKED, NULL);
+
+    s_tasks_title = lv_label_create(s_tasks_panel);
+    lv_label_set_text(s_tasks_title, "Tasks");
+    lv_obj_set_style_text_font(s_tasks_title, &lv_font_montserrat_28, 0);
+    lv_obj_set_style_text_color(s_tasks_title, lv_color_hex(0x81C784), 0);
+    lv_obj_align(s_tasks_title, LV_ALIGN_TOP_MID, 24, 52);
+
+    lv_obj_t *close = lv_button_create(s_tasks_panel);     /* round "v" at the top-left, inside the corner */
+    lv_obj_set_size(close, 48, 48);
+    lv_obj_set_style_bg_color(close, lv_color_hex(0x37474F), 0);
+    lv_obj_set_style_radius(close, 24, 0);
+    lv_obj_set_style_shadow_width(close, 0, 0);
+    lv_obj_align(close, LV_ALIGN_TOP_LEFT, 36, 48);
+    lv_obj_add_event_cb(close, tasks_close_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *cl = lv_label_create(close);
+    lv_label_set_text(cl, LV_SYMBOL_DOWN);
+    lv_obj_set_style_text_color(cl, lv_color_white(), 0);
+    lv_obj_center(cl);
+
+    s_tasks_count = lv_label_create(s_tasks_panel);
+    lv_label_set_text(s_tasks_count, " ");
+    lv_obj_set_style_text_font(s_tasks_count, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(s_tasks_count, lv_color_hex(0x90A4AE), 0);
+    lv_obj_align(s_tasks_count, LV_ALIGN_TOP_MID, 24, 88);
+
+    s_tasks_list = lv_obj_create(s_tasks_panel);
+    lv_obj_set_size(s_tasks_list, SCREEN_W, SCREEN_H - 112);
+    lv_obj_set_pos(s_tasks_list, 0, 112);
+    lv_obj_set_style_bg_opa(s_tasks_list, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(s_tasks_list, 0, 0);
+    lv_obj_set_style_pad_hor(s_tasks_list, 22, 0);
+    lv_obj_set_style_pad_ver(s_tasks_list, 0, 0);
+    lv_obj_set_style_pad_row(s_tasks_list, 0, 0);
+    lv_obj_set_flex_flow(s_tasks_list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_scroll_dir(s_tasks_list, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(s_tasks_list, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_remove_flag(s_tasks_list, LV_OBJ_FLAG_GESTURE_BUBBLE);   /* scrolling must not close the panel */
+
+    lv_obj_t *add = lv_button_create(s_tasks_panel);       /* round "+" at the top-right */
+    lv_obj_set_size(add, 48, 48);
+    lv_obj_set_style_bg_color(add, lv_color_hex(TASKS_COLOR), 0);
+    lv_obj_set_style_radius(add, 24, 0);
+    lv_obj_set_style_shadow_width(add, 0, 0);
+    lv_obj_align(add, LV_ALIGN_TOP_RIGHT, -36, 48);
+    lv_obj_add_event_cb(add, tasks_open_add_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *al = lv_label_create(add);
+    lv_label_set_text(al, LV_SYMBOL_PLUS);
+    lv_obj_set_style_text_color(al, lv_color_white(), 0);
+    lv_obj_center(al);
+
+    /* Quick-add menu: a few preset tasks, one tap each. */
+    s_tasks_add_view = lv_obj_create(s_tasks_panel);
+    lv_obj_set_size(s_tasks_add_view, SCREEN_W, SCREEN_H);
+    lv_obj_set_pos(s_tasks_add_view, 0, 0);
+    lv_obj_set_style_bg_color(s_tasks_add_view, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(s_tasks_add_view, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(s_tasks_add_view, 0, 0);
+    lv_obj_set_style_border_width(s_tasks_add_view, 0, 0);
+    lv_obj_set_style_pad_all(s_tasks_add_view, 0, 0);
+    lv_obj_remove_flag(s_tasks_add_view, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_remove_flag(s_tasks_add_view, LV_OBJ_FLAG_GESTURE_BUBBLE);
+    lv_obj_add_flag(s_tasks_add_view, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_event_cb(s_tasks_add_view, screen_tap_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *at = lv_label_create(s_tasks_add_view);
+    lv_label_set_text(at, "Add a task");
+    lv_obj_set_style_text_font(at, &lv_font_montserrat_28, 0);
+    lv_obj_set_style_text_color(at, lv_color_hex(0x81C784), 0);
+    lv_obj_align(at, LV_ALIGN_TOP_MID, 24, 52);
+
+    lv_obj_t *ab = lv_button_create(s_tasks_add_view);     /* "<" back to the list */
+    lv_obj_set_size(ab, 48, 48);
+    lv_obj_set_style_bg_color(ab, lv_color_hex(0x37474F), 0);
+    lv_obj_set_style_radius(ab, 24, 0);
+    lv_obj_set_style_shadow_width(ab, 0, 0);
+    lv_obj_align(ab, LV_ALIGN_TOP_LEFT, 36, 48);
+    lv_obj_add_event_cb(ab, tasks_add_back_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *abl = lv_label_create(ab);
+    lv_label_set_text(abl, LV_SYMBOL_LEFT);
+    lv_obj_set_style_text_color(abl, lv_color_white(), 0);
+    lv_obj_center(abl);
+
+    lv_obj_t *col = lv_obj_create(s_tasks_add_view);
+    lv_obj_set_size(col, SCREEN_W, SCREEN_H - 130);
+    lv_obj_set_pos(col, 0, 130);
+    lv_obj_set_style_bg_opa(col, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(col, 0, 0);
+    lv_obj_set_style_pad_all(col, 0, 0);
+    lv_obj_set_style_pad_row(col, 16, 0);
+    lv_obj_set_flex_flow(col, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(col, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_remove_flag(col, LV_OBJ_FLAG_SCROLLABLE);
+    for (int k = 0; k < (int)TASK_PRESETS; k++) {
+        lv_obj_t *b = lv_button_create(col);
+        lv_obj_set_size(b, 320, 60);
+        lv_obj_set_style_bg_color(b, lv_color_hex(0x263238), 0);
+        lv_obj_set_style_border_color(b, lv_color_hex(TASKS_COLOR), 0);
+        lv_obj_set_style_border_width(b, 2, 0);
+        lv_obj_set_style_radius(b, 30, 0);
+        lv_obj_set_style_shadow_width(b, 0, 0);
+        lv_obj_add_event_cb(b, tasks_add_preset_cb, LV_EVENT_CLICKED, (void *)(intptr_t)k);
+        lv_obj_add_event_cb(b, screen_tap_cb, LV_EVENT_CLICKED, NULL);
+        lv_obj_t *l = lv_label_create(b);
+        lv_label_set_text(l, s_task_presets[k]);
+        lv_obj_set_style_text_font(l, &lv_font_montserrat_20, 0);
+        lv_obj_set_style_text_color(l, lv_color_white(), 0);
+        lv_obj_center(l);
+    }
+
+    lv_obj_move_foreground(s_tasks_panel);
+}
+
+static void tasks_slide(bool in)
+{
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, s_tasks_panel);
+    lv_anim_set_exec_cb(&a, anim_y_cb);
+    lv_anim_set_duration(&a, FACE_ANIM_MS);
+    lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
+    if (in) {
+        tasks_show_add(false);
+        tasks_render();
+        lv_obj_remove_flag(s_tasks_panel, LV_OBJ_FLAG_HIDDEN);
+        lv_anim_set_values(&a, SCREEN_H, 0);
+    } else {
+        if (s_tasks_purge_timer) { lv_timer_delete(s_tasks_purge_timer); s_tasks_purge_timer = NULL; tasks_purge_cb(NULL); }
+        lv_anim_set_values(&a, 0, SCREEN_H);
+        lv_anim_set_completed_cb(&a, anim_hide_when_done);
+    }
+    lv_anim_start(&a);
+}
+
+/* ---------------------------------------------------------------------- */
 /* Face transitions                                                       */
 /* ---------------------------------------------------------------------- */
 static void face_set(face_t face)
@@ -1460,13 +1784,15 @@ static void face_set(face_t face)
     if (face == s_face) return;
     face_t prev = s_face;
     s_face = face;
-    ESP_LOGI(TAG, "Face -> %s", face == FACE_HOME ? "home" : face == FACE_STOPWATCH ? "stopwatch" : face == FACE_CALENDAR ? "calendar" : "clock");
+    ESP_LOGI(TAG, "Face -> %s", face == FACE_HOME ? "home" : face == FACE_STOPWATCH ? "stopwatch" : face == FACE_CALENDAR ? "calendar" : face == FACE_TASKS ? "tasks" : "clock");
 
     /* Stopwatch and calendar panels slide over the home face; nothing else changes. */
     if (face == FACE_STOPWATCH) { sw_slide(true);  return; }
     if (prev == FACE_STOPWATCH) { sw_slide(false); return; }
     if (face == FACE_CALENDAR)  { cal_slide(true);  return; }
     if (prev == FACE_CALENDAR)  { cal_slide(false); return; }
+    if (face == FACE_TASKS)     { tasks_slide(true);  return; }
+    if (prev == FACE_TASKS)     { tasks_slide(false); return; }
 
     lv_obj_t *scr = lv_screen_active();
     bool home = (face == FACE_HOME);
@@ -1527,6 +1853,9 @@ static void face_reset_instant(void)
     lv_anim_delete(s_cal_panel, NULL);
     lv_obj_set_y(s_cal_panel, -SCREEN_H);
     lv_obj_add_flag(s_cal_panel, LV_OBJ_FLAG_HIDDEN);
+    lv_anim_delete(s_tasks_panel, NULL);
+    lv_obj_set_y(s_tasks_panel, SCREEN_H);
+    lv_obj_add_flag(s_tasks_panel, LV_OBJ_FLAG_HIDDEN);
 
     lv_obj_t *hide[] = { s_hello_label, s_date_label, s_ampm_label, s_batt_label };
     for (size_t i = 0; i < sizeof(hide) / sizeof(hide[0]); i++) {
@@ -1833,6 +2162,7 @@ static void build_ui(void)
     s_clock_timer = lv_timer_create(clock_tick, 250, NULL);
     sw_build(scr);
     cal_build(scr);
+    tasks_build(scr);
 
     claude_build(scr);
 

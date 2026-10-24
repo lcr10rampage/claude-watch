@@ -22,6 +22,14 @@ What it does today:
   (`main/calstore.c`: twelve 16 KB raw slots at the start of the otherwise
   unused `storage` partition) and are loaded over USB by the Pi's
   `/calendar-refresh` skill, see `../README.md`. Nothing is fetched by the watch.
+- **Swipe up** on the photo face → **tasks**: a checklist that slides up from
+  the bottom. Tick a box and the task turns green, then disappears for good
+  about 0.7 s later (saved to flash). The green `+` opens a quick-add menu of
+  preset tasks (Finish Homework, Check Canvas, Check on Cricket, Check
+  Calendar); one tap adds one. The `v` button or a swipe down closes the panel.
+  Tasks live in the same slot store under the key `tasks`, one `T 0|1 <text>`
+  line each, and load over USB with `CALBEGIN tasks` / `CALADD T 0 <text>` /
+  `CALEND`. Claude-side add/complete tools are the next step.
 - **Double-tap the bottom-right corner** (right 40 % × bottom 30 % of the
   glass, taps ≤ 500 ms apart) → screen off; same again → screen on. Works on
   every face and while the screen is dark. Waking always lands on the photo
@@ -105,7 +113,7 @@ Stop any serial listener before flashing; the port cannot be shared.
 `SWIPE LEFT|RIGHT` (stopwatch in/out), `DTAP` (toggle screen), `BOOT` (Claude
 menu), `ASK <question>`, `WIFI` (ip, rssi, server reachable), `HEAP`, `BATT`,
 `SCAN` (list visible networks), `NEXTNET` (drop to the next known network),
-`SWIPE DOWN|UP` (calendar in/out), `CALOPEN n` (open week n), calendar upload
+`SWIPE DOWN|UP` (calendar in/out, tasks in/out), `CALOPEN n` (open week n), slot upload
 `CALCLEAR`, `CALBEGIN YYYY-MM-DD`, `CALADD <line>`, `CALEND`, `CALLIST`,
 `DUMP` (on-device event log), `LOG ON|OFF` (verbose touch/accelerometer logging).
 

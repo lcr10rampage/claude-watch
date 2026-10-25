@@ -118,6 +118,28 @@ Funnel and tailscaled restart on boot by themselves. Put the URL in the
 watch's `main/secrets.h` as `WATCH_SERVER_URL`; the `X-Watch-Token` header is
 the only thing guarding the endpoint, so keep the token long and private.
 
+## Voice questions
+
+`POST /ask-voice` takes the watch's recording (16 kHz mono 16-bit PCM, raw or
+WAV) and runs it through faster-whisper on the Pi, then through Claude like a
+typed question. Setup once:
+
+```bash
+python3 -m venv ~/stt-env && ~/stt-env/bin/pip install faster-whisper
+# run the server with that python (claude-watch.service already does)
+```
+
+The reply is `{"heard", "answer", "retry"}`. `retry` is true when the clip was
+too quiet, Whisper's confidence was low, or Claude replied "Say that again?"
+because the words made no sense; the watch then listens again. Two headers
+change what happens: `X-Watch-Context: calendar` makes Claude add the event to
+Google Calendar and return `{"event": {date, time, title}}`; `X-Watch-Context:
+tasks` returns the cleaned-up `task` title without calling Claude. Knobs in
+`server/.env.example` (`STT_MODEL` tiny.en by default; base.en is slower and
+was not better on Luke's voice). `tools/transcribe.py` runs Whisper on a WAV
+by hand. Claude may also use WebSearch/WebFetch; sources and links are
+stripped from watch answers.
+
 ## Calendar on the watch (`/calendar-refresh`)
 
 The watch shows your Google Calendar week by week, but it never talks to

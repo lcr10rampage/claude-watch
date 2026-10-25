@@ -26,6 +26,8 @@
 #include "esp_attr.h"
 #include "driver/usb_serial_jtag.h"
 #include "calstore.h"
+#include "mic.h"
+#include "mbedtls/base64.h"
 #include "esp_timer.h"
 #include "esp_random.h"
 #include "qmi8658.h"
@@ -40,7 +42,14 @@ static const char *TAG = "hello_luke";
 typedef enum { FACE_CLOCK = 0, FACE_HOME, FACE_STOPWATCH, FACE_CALENDAR, FACE_TASKS } face_t;
 static face_t s_face;
 static void face_set(face_t face);
+static void screen_set(bool on);
+typedef enum { CL_IDLE = 0, CL_MENU, CL_LISTENING, CL_WORKING, CL_ANSWER } claude_state_t;
+static claude_state_t s_cl_state = CL_IDLE;
+static bool s_sw_running = false;
+#define AUTO_OFF_S             0       /* auto screen-off disabled (it killed answers mid-read); AUTOOFF <s> over serial re-enables */
+static volatile int s_auto_off_s = AUTO_OFF_S;
 static void cal_upload_begin(const char *start);
+#define BATTLOG_KEY "battlog"
 static void cal_open_week(int i);
 static bool cal_upload_add(const char *text);
 static esp_err_t cal_upload_end(void);
@@ -89,6 +98,9 @@ static inline bool touch_quiet(void) { return esp_timer_get_time() < s_touch_qui
 static void corner_tap(int x, int y);
 static void claude_ask(const char *question);
 static void claude_button(void);
+static void claude_long_press(void);
+static void claude_listen_done(void);
+static void claude_set_state(claude_state_t st, const char *text);
 static void clock_tick(lv_timer_t *timer);
 static bool s_raw_diff = false;   /* unused now; kept for the RAW serial command */
 static bool s_calib_log = false;  /* calibration logging, "LOG ON|OFF" over serial */
@@ -216,11 +228,42 @@ static void clock_setup(void)
 #define AXP_ADC_CTRL        0x30   /* bit0: enable VBAT ADC            */
 #define AXP_VBAT_H          0x34   /* [4:0] high bits, 0x35 low byte   */
 #define AXP_BAT_PERCENT     0xA4
+#define AXP_COMMON_CFG      0x10   /* bit0: soft power off             */
+#define AXP_KEY_TIMING      0x27   /* [1:0] off-hold 4/6/8/10 s, [3:2] on-hold 128ms/512ms/1s/2s */
+#define AXP_INTEN2          0x41   /* bit3: power-key short press IRQ enable */
+#define AXP_INTSTS2         0x49   /* bit3: power-key short press (write 1 to clear) */
+#define AXP_KEY_SHORT_BIT   0x08
 static i2c_master_dev_handle_t s_pmu = NULL;
 
 static esp_err_t pmu_rd(uint8_t reg, uint8_t *val)
 {
     return i2c_master_transmit_receive(s_pmu, &reg, 1, val, 1, 50);
+}
+
+static esp_err_t pmu_wr(uint8_t reg, uint8_t val)
+{
+    uint8_t w[2] = { reg, val };
+    return i2c_master_transmit(s_pmu, w, 2, 50);
+}
+
+/* Power key: a short press powers the watch off (firmware does it via the PMU); holding
+   the key 1 s powers it on. The hardware long-press-off stays as a 4 s fallback. */
+static void pmu_key_setup(void)
+{
+    uint8_t v = 0;
+    if (pmu_rd(AXP_KEY_TIMING, &v) == ESP_OK) pmu_wr(AXP_KEY_TIMING, (uint8_t)((v & 0xF0) | 0x08));   /* off 4 s, on 1 s */
+    if (pmu_rd(AXP_INTEN2, &v) == ESP_OK)     pmu_wr(AXP_INTEN2, (uint8_t)(v | AXP_KEY_SHORT_BIT));
+    pmu_wr(AXP_INTSTS2, AXP_KEY_SHORT_BIT);                                                           /* clear anything latched by the power-on press */
+}
+
+static void pmu_power_off(void)
+{
+    ESP_LOGI(TAG, "Power key: powering off");
+    evlog_add('P', 'X', 0);
+    if (bsp_display_lock(300)) { bsp_display_backlight_off(); bsp_display_unlock(); }
+    vTaskDelay(pdMS_TO_TICKS(100));
+    uint8_t v = 0;
+    if (pmu_rd(AXP_COMMON_CFG, &v) == ESP_OK) pmu_wr(AXP_COMMON_CFG, (uint8_t)(v | 0x01));
 }
 
 static esp_err_t pmu_init(void)
@@ -259,6 +302,18 @@ static bool pmu_read(int *mv, int *pct, char *state)
 /*   SETTIME YYYY-MM-DD HH:MM:SS   -> sets RTC + system time, replies OK  */
 /*   GETTIME                       -> replies with the current time       */
 /* ---------------------------------------------------------------------- */
+/* Blocking write for bulk dumps: console_reply() gives up after 100 ms and drops bytes. */
+static void console_write_all(const char *msg)
+{
+    size_t len = strlen(msg);
+    while (len) {                                   /* the driver's ring buffer is 256 B: items must be smaller */
+        size_t piece = len < 64 ? len : 64;
+        int w = usb_serial_jtag_write_bytes(msg, piece, pdMS_TO_TICKS(1000));
+        if (w <= 0) break;
+        msg += w; len -= (size_t)w;
+    }
+}
+
 static void console_reply(const char *msg)
 {
     usb_serial_jtag_write_bytes(msg, strlen(msg), pdMS_TO_TICKS(100));
@@ -300,6 +355,34 @@ static void console_handle_line(char *line)
         console_reply("OK boot\n");
     } else if (strncmp(line, "SCAN", 4) == 0) {
         net_scan(console_reply);
+    } else if (strncmp(line, "AUTOOFF ", 8) == 0) {        /* AUTOOFF 0 disables auto screen-off (for bench tests) */
+        s_auto_off_s = atoi(line + 8);
+        console_reply("OK autooff\n");
+    } else if (strncmp(line, "RADIO ", 6) == 0) {          /* RADIO ON|OFF */
+        net_set_active(strncmp(line + 6, "ON", 2) == 0);
+        console_reply("OK radio\n");
+    } else if (strncmp(line, "MICREC ", 7) == 0) {           /* MICREC <secs>: record without the button */
+        esp_err_t err = mic_start(atoi(line + 7));
+        console_reply(err == ESP_OK ? "OK micrec\n" : "ERR micrec\n");
+    } else if (strncmp(line, "VOICEASK", 8) == 0) {         /* send the last recording as a voice question */
+        if (bsp_display_lock(200)) { if (!s_screen_on) screen_set(true); claude_listen_done(); bsp_display_unlock(); }
+        console_reply("OK voiceask\n");
+    } else if (strncmp(line, "MICSTOP", 7) == 0) {
+        mic_stop(); console_reply("OK micstop\n");
+    } else if (strncmp(line, "MICLEVEL", 8) == 0) {
+        char out[32]; snprintf(out, sizeof(out), "MICLEVEL %d\n", mic_level()); console_reply(out);
+    } else if (strncmp(line, "MICDUMP", 7) == 0) {            /* base64 lines: MICB64 ... then MICEND <bytes> <rate> */
+        size_t n = 0; const int16_t *d = mic_data(&n);
+        const uint8_t *bytes = (const uint8_t *)d; size_t total = n * 2, off = 0;
+        static char b64[4 * 256 / 3 + 16];
+        while (d && off < total) {
+            size_t chunk = total - off < 240 ? total - off : 240, olen = 0;
+            if (mbedtls_base64_encode((unsigned char *)b64, sizeof(b64), &olen, bytes + off, chunk) == 0) {
+                b64[olen] = '\0'; console_write_all("MICB64 "); console_write_all(b64); console_write_all("\n");
+            }
+            off += chunk;
+        }
+        char out[48]; snprintf(out, sizeof(out), "MICEND %u %d\n", (unsigned)total, MIC_RATE); console_reply(out);
     } else if (strncmp(line, "NEXTNET", 7) == 0) {
         net_next();
         console_reply("OK switching network\n");
@@ -315,6 +398,19 @@ static void console_handle_line(char *line)
                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL), (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL),
                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
         console_reply(out);
+    } else if (strncmp(line, "POWEROFF", 8) == 0) {
+        console_reply("OK powering off\n");
+        pmu_power_off();
+    } else if (strncmp(line, "BATTLOG CLEAR", 13) == 0) {
+        console_reply(calstore_write(BATTLOG_KEY, "", 0) == ESP_OK ? "OK battlog cleared\n" : "ERR battlog\n");
+    } else if (strncmp(line, "BATTLOG", 7) == 0) {
+        char *buf = heap_caps_malloc(CALSTORE_MAX_TEXT + 1, MALLOC_CAP_SPIRAM);
+        if (buf) {
+            calstore_read(BATTLOG_KEY, buf, CALSTORE_MAX_TEXT + 1);
+            for (char *p = buf; *p; ) { char *nl = strchr(p, '\n'); if (nl) *nl = '\0'; console_reply(p); console_reply("\n"); if (!nl) break; p = nl + 1; }
+            free(buf);
+        }
+        console_reply("END battlog\n");
     } else if (strncmp(line, "BATT", 4) == 0) {
         int mv, pct; char st;
         char out[64];
@@ -431,6 +527,8 @@ static volatile int  s_touch_poll_ms = 20;
 #define TOUCH_POLL_ON_MS       20
 #define TOUCH_POLL_OFF_MS      60
 #define LVGL_INDEV_OFF_MS      60
+#define BRIGHTNESS_PCT         70      /* AMOLED: brightness is the second biggest draw after the radio */
+#define AUTO_OFF_BUSY_S        60      /* ...but longer while Claude is listening/answering or the stopwatch runs */
 
 static void power_init(void)
 {
@@ -481,11 +579,19 @@ static void screen_set(bool on)
     s_screen_on = on;
     if (on) {
         power_mode(true);
+#if ENABLE_NET
+        net_set_active(true);
+#endif
+        lv_display_trigger_activity(NULL);     /* start the auto-off clock from now */
         clock_tick(NULL);          /* timers were paused: refresh before showing */
         bsp_display_backlight_on();
+        bsp_display_brightness_set(BRIGHTNESS_PCT);
     } else {
         bsp_display_backlight_off();
         face_reset_instant();      /* next wake always starts on the photo face */
+#if ENABLE_NET
+        net_set_active(false);
+#endif
         power_mode(false);
     }
     ESP_LOGI(TAG, "Screen %s", on ? "on" : "off");
@@ -765,14 +871,14 @@ static void imu_task(void *arg)
         return;
     }
     qmi8658_set_accel_range(&dev, QMI8658_ACCEL_RANGE_8G);
-    qmi8658_set_accel_odr(&dev, QMI8658_ACCEL_ODR_500HZ);
+    qmi8658_set_accel_odr(&dev, QMI8658_ACCEL_ODR_62_5HZ);   /* logging only; 500 Hz was wasted power */
 
     int64_t last_log_us = 0;
     float window_peak = 0;
     float px = 0, py = 0, pz = 0;
     int stale = 0, errors = 0;
     for (;;) {
-        vTaskDelay(pdMS_TO_TICKS(8));
+        vTaskDelay(pdMS_TO_TICKS(100));
         float x, y, z;
         if (qmi8658_read_accel(&dev, &x, &y, &z) != ESP_OK) { i2c_recover(&errors, "imu"); continue; }
         float mag = sqrtf(x * x + y * y + z * z) / 1000.0f;   /* driver reports milli-g */
@@ -926,6 +1032,15 @@ static void photo_pick_random(void)
 static void clock_tick(lv_timer_t *timer)
 {
     (void)timer;
+    if (timer && s_screen_on && s_auto_off_s > 0) {
+        bool busy = (s_cl_state != CL_IDLE) || (s_face == FACE_STOPWATCH && s_sw_running);
+        uint32_t limit = (uint32_t)(busy ? AUTO_OFF_BUSY_S : s_auto_off_s) * 1000;
+        if (lv_display_get_inactive_time(NULL) > limit) {
+            ESP_LOGI(TAG, "Auto screen-off after %u s idle", (unsigned)(limit / 1000));
+            screen_set(false);
+            return;
+        }
+    }
     time_t now = time(NULL);
     struct tm t;
     localtime_r(&now, &t);
@@ -1007,7 +1122,6 @@ static int32_t time_label_target_y(face_t face)
 /* Stopwatch face                                                         */
 /* ---------------------------------------------------------------------- */
 static lv_obj_t *s_sw_panel, *s_sw_label, *s_sw_startstop_label;
-static bool      s_sw_running = false;
 static int64_t   s_sw_accum_us = 0;      /* time accumulated while stopped   */
 static int64_t   s_sw_start_us = 0;      /* esp_timer value at last start     */
 
@@ -1349,6 +1463,45 @@ static void cal_build_weeks(void)
     }
 }
 
+/* Slot a freshly added event into the stored week so it shows without a refresh.
+   Lines: "D <date> <label>" then "E <time>|<title>"... ; append after the day's last E line. */
+static bool cal_insert_event(const char *date, const char *when, const char *title)
+{
+    struct tm t = { 0 };
+    if (!date || sscanf(date, "%d-%d-%d", &t.tm_year, &t.tm_mon, &t.tm_mday) != 3) return false;
+    t.tm_year -= 1900; t.tm_mon -= 1; t.tm_hour = 12; t.tm_isdst = -1;
+    time_t day = mktime(&t); localtime_r(&day, &t);
+    time_t sunday = day - (time_t)t.tm_wday * 86400;
+    struct tm ws; localtime_r(&sunday, &ws);
+    char start[12]; strftime(start, sizeof(start), "%Y-%m-%d", &ws);
+
+    char *buf = heap_caps_malloc(CALSTORE_MAX_TEXT + 1, MALLOC_CAP_SPIRAM);
+    char *out = heap_caps_malloc(CALSTORE_MAX_TEXT + 1, MALLOC_CAP_SPIRAM);
+    if (!buf || !out) { free(buf); free(out); return false; }
+    size_t n = calstore_read(start, buf, CALSTORE_MAX_TEXT + 1);
+    if (n == 0) { ESP_LOGW(TAG, "week %s not stored; event not inserted", start); free(buf); free(out); return false; }
+
+    char line[160];
+    snprintf(line, sizeof(line), "E %s|%s\n", (when && when[0]) ? when : "All day", title ? title : "");
+    size_t o = 0; bool in_day = false, done = false;
+    for (char *p = buf; *p && !done; ) {
+        char *nl = strchr(p, '\n'); size_t len = nl ? (size_t)(nl - p + 1) : strlen(p);
+        if (p[0] == 'D' && p[1] == ' ') {
+            if (in_day) { o += snprintf(out + o, CALSTORE_MAX_TEXT - o, "%s", line); in_day = false; done = true; if (o >= CALSTORE_MAX_TEXT) break; }
+            else in_day = strncmp(p + 2, date, 10) == 0;
+        }
+        if (o + len >= CALSTORE_MAX_TEXT) break;
+        memcpy(out + o, p, len); o += len;
+        p += len;
+        if (done) { size_t rest = strlen(p); if (o + rest < CALSTORE_MAX_TEXT) { memcpy(out + o, p, rest); o += rest; } }
+    }
+    if (in_day && !done) o += snprintf(out + o, CALSTORE_MAX_TEXT - o, "%s", line);   /* last day of the week */
+    esp_err_t err = calstore_write(start, out, o);
+    ESP_LOGI(TAG, "event inserted into week %s: %s", start, esp_err_to_name(err));
+    free(buf); free(out);
+    return err == ESP_OK;
+}
+
 static void cal_build(lv_obj_t *scr)
 {
     s_cal_panel = lv_obj_create(scr);
@@ -1604,22 +1757,29 @@ static void tasks_add_back_cb(lv_event_t *e)
     tasks_show_add(false);
 }
 
-/* A preset button: append it as an open task (or reopen it if it is already there and done). */
+/* Append an open task (or reopen it if it is already there and done); saves and redraws. */
+static bool tasks_add_text(const char *text)
+{
+    if (!text || !text[0]) return false;
+    if (s_ntasks == 0) tasks_load();                 /* panel may never have been opened this boot */
+    int found = -1;
+    for (int i = 0; i < s_ntasks; i++) if (strcmp(s_tasks[i].text, text) == 0) { found = i; break; }
+    if (found >= 0) s_tasks[found].done = false;
+    else if (s_ntasks < TASKS_MAX) { s_tasks[s_ntasks].done = false; strlcpy(s_tasks[s_ntasks].text, text, sizeof(s_tasks[0].text)); s_ntasks++; }
+    else return false;
+    tasks_save();
+    ESP_LOGI(TAG, "Task added: %s", text);
+    if (s_face == FACE_TASKS) { tasks_show_add(false); tasks_render(); }
+    return true;
+}
+
+/* A preset button from the quick-add menu. */
 static void tasks_add_preset_cb(lv_event_t *e)
 {
     if (!s_screen_on || touch_quiet()) return;
     int k = (int)(intptr_t)lv_event_get_user_data(e);
     if (k < 0 || k >= (int)TASK_PRESETS) return;
-    const char *text = s_task_presets[k];
-    int found = -1;
-    for (int i = 0; i < s_ntasks; i++) if (strcmp(s_tasks[i].text, text) == 0) { found = i; break; }
-    if (found >= 0) s_tasks[found].done = false;
-    else if (s_ntasks < TASKS_MAX) { s_tasks[s_ntasks].done = false; strlcpy(s_tasks[s_ntasks].text, text, sizeof(s_tasks[0].text)); s_ntasks++; }
-    else return;
-    tasks_save();
-    ESP_LOGI(TAG, "Task added: %s", text);
-    tasks_show_add(false);
-    tasks_render();
+    tasks_add_text(s_task_presets[k]);
 }
 
 static void tasks_close_cb(lv_event_t *e)
@@ -1886,9 +2046,10 @@ static void face_toggle(void)
 #define CLAUDE_RING_WIDTH    16
 #define BOOT_BUTTON_GPIO     GPIO_NUM_0
 
-typedef enum { CL_IDLE = 0, CL_MENU, CL_LISTENING, CL_WORKING, CL_ANSWER } claude_state_t;
-static claude_state_t s_cl_state = CL_IDLE;
-static lv_obj_t *s_cl_layer, *s_cl_ring, *s_cl_box, *s_cl_text, *s_cl_menu;
+static lv_obj_t *s_cl_layer, *s_cl_ring, *s_cl_box, *s_cl_text, *s_cl_menu, *s_cl_blob, *s_cl_hint, *s_cl_heard;
+static lv_timer_t *s_cl_blob_timer;
+#define BLOB_MIN 90
+#define BLOB_MAX 260
 #define CLAUDE_DIM_OPA       LV_OPA_70   /* how much the photo is darkened behind the menu */
 static lv_anim_t s_cl_pulse;
 
@@ -1897,10 +2058,33 @@ static void anim_border_opa_cb(void *obj, int32_t v)
     lv_obj_set_style_border_opa((lv_obj_t *)obj, (lv_opa_t)v, 0);
 }
 
+/* While listening: the centre circle follows the microphone level (smoothed). */
+static void blob_tick(lv_timer_t *t)
+{
+    (void)t;
+    static float cur = BLOB_MIN;
+    float target = BLOB_MIN + (BLOB_MAX - BLOB_MIN) * (mic_level() / 100.0f);
+    cur += (target - cur) * (target > cur ? 0.45f : 0.18f);      /* jump up fast, settle slowly */
+    int d = (int)cur;
+    lv_obj_set_size(s_cl_blob, d, d);
+    lv_obj_set_style_radius(s_cl_blob, d / 2, 0);
+    lv_obj_center(s_cl_blob);
+    if (!mic_recording() && s_cl_state == CL_LISTENING) {        /* hit the 15 s cap */
+        claude_listen_done();
+    }
+}
+
+static char s_cl_heard_text[160];        /* what the Pi heard, shown small above a voice answer */
+static const char *s_cl_listen_hint = "Listening...  press again to send";
+
 static void claude_set_state(claude_state_t st, const char *text)
 {
     s_cl_state = st;
     lv_anim_delete(s_cl_ring, anim_border_opa_cb);
+    if (s_cl_blob_timer) { lv_timer_delete(s_cl_blob_timer); s_cl_blob_timer = NULL; }
+    lv_obj_add_flag(s_cl_blob, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(s_cl_hint, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(s_cl_heard, LV_OBJ_FLAG_HIDDEN);
     switch (st) {
     case CL_IDLE:
         lv_obj_add_flag(s_cl_layer, LV_OBJ_FLAG_HIDDEN);
@@ -1924,6 +2108,16 @@ static void claude_set_state(claude_state_t st, const char *text)
         lv_obj_add_flag(s_cl_box, LV_OBJ_FLAG_HIDDEN);
         lv_obj_remove_flag(s_cl_ring, LV_OBJ_FLAG_HIDDEN);
         lv_obj_set_style_border_opa(s_cl_ring, LV_OPA_COVER, 0);
+        if (st == CL_LISTENING) {
+            lv_obj_remove_flag(s_cl_blob, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_set_size(s_cl_blob, BLOB_MIN, BLOB_MIN);
+            lv_obj_set_style_radius(s_cl_blob, BLOB_MIN / 2, 0);
+            lv_obj_center(s_cl_blob);
+            lv_label_set_text(s_cl_hint, s_cl_listen_hint);
+            s_cl_listen_hint = "Listening...  press again to send";
+            lv_obj_remove_flag(s_cl_hint, LV_OBJ_FLAG_HIDDEN);
+            s_cl_blob_timer = lv_timer_create(blob_tick, 40, NULL);
+        }
         if (st == CL_WORKING) {
             lv_anim_init(&s_cl_pulse);
             lv_anim_set_var(&s_cl_pulse, s_cl_ring);
@@ -1938,6 +2132,8 @@ static void claude_set_state(claude_state_t st, const char *text)
     case CL_ANSWER:
         lv_obj_remove_flag(s_cl_layer, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(s_cl_ring, LV_OBJ_FLAG_HIDDEN);
+        if (s_cl_heard_text[0]) { lv_label_set_text(s_cl_heard, s_cl_heard_text); lv_obj_remove_flag(s_cl_heard, LV_OBJ_FLAG_HIDDEN); }
+        else lv_obj_add_flag(s_cl_heard, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(s_cl_menu, LV_OBJ_FLAG_HIDDEN);
         lv_obj_set_style_bg_color(s_cl_layer, lv_color_hex(CLAUDE_ORANGE), 0);
         lv_obj_set_style_bg_opa(s_cl_layer, LV_OPA_COVER, 0);
@@ -1969,6 +2165,7 @@ static void ask_task(void *arg)
     evlog_add('Q', (int)(err == ESP_OK), status);
     if (bsp_display_lock(500)) {
         if (!s_screen_on) screen_set(true);
+        s_cl_heard_text[0] = '\0';
         claude_set_state(CL_ANSWER, answer);
         bsp_display_unlock();
     }
@@ -1986,17 +2183,84 @@ static void claude_ask(const char *question)
 
 /* BOOT button: opens the Claude menu; pressing it again (from any Claude state)
  * closes everything and returns to the watch face. */
+/* Runs in its own task: waits for the mic to finish, uploads the clip, shows the result.
+   A "retry" reply drops straight back into listening. */
+static const char *s_voice_context = NULL;   /* set when listening starts: NULL, "calendar" or "tasks" */
+static bool tasks_add_text(const char *text);
+static bool cal_insert_event(const char *date, const char *when, const char *title);
+
+static void voice_task(void *arg)
+{
+    (void)arg;
+    for (int i = 0; i < 50 && mic_recording(); i++) vTaskDelay(pdMS_TO_TICKS(20));
+    size_t n = 0;
+    const int16_t *pcm = mic_data(&n);
+    voice_result_t r = { 0 }; int status = 0;
+    esp_err_t err;
+    if (n < MIC_RATE / 2) { r.answer = strdup("That was too short. Hold the button a moment longer."); err = ESP_FAIL; }
+    else err = net_ask_voice(pcm, n, s_voice_context, &r, &status);
+    ESP_LOGI(TAG, "Voice[%s] (%s, http %d, retry %d): heard '%s' -> %s", s_voice_context ? s_voice_context : "ask",
+             esp_err_to_name(err), status, r.retry, r.heard ? r.heard : "", r.answer ? r.answer : "");
+    evlog_add('Q', (int)(err == ESP_OK), status);
+    if (bsp_display_lock(500)) {
+        if (!s_screen_on) screen_set(true);
+        if (r.task[0]) tasks_add_text(r.task);
+        if (r.ev_date[0]) cal_insert_event(r.ev_date, r.ev_time, r.ev_title);
+        if (r.retry && s_cl_state == CL_WORKING && mic_start(MIC_MAX_SECS) == ESP_OK) {
+            s_cl_listen_hint = "Say that again?";
+            claude_set_state(CL_LISTENING, NULL);
+        } else {
+            s_cl_heard_text[0] = '\0';          /* transcript stays in the log only; Luke doesn't want it on screen */
+            claude_set_state(CL_ANSWER, r.answer);
+        }
+        bsp_display_unlock();
+    }
+    free(r.heard); free(r.answer);
+    vTaskDelete(NULL);
+}
+
+/* Recording finished (second press or the cap): send it. */
+static void claude_listen_done(void)
+{
+    mic_stop();
+    ESP_LOGI(TAG, "BOOT: stop listening, %.1f s", (double)mic_seconds());
+    claude_set_state(CL_WORKING, NULL);
+    xTaskCreateWithCaps(voice_task, "voice", 8192, NULL, 3, NULL, MALLOC_CAP_SPIRAM);
+}
+
+/* Short press: start listening, or send what was heard, or dismiss. */
 static void claude_button(void)
 {
     if (!bsp_display_lock(200)) return;
     if (!s_screen_on) screen_set(true);
-    if (s_cl_state == CL_IDLE) {
-        ESP_LOGI(TAG, "BOOT: menu");
-        claude_set_state(CL_MENU, NULL);
-    } else if (s_cl_state != CL_WORKING) {
+    switch (s_cl_state) {
+    case CL_IDLE:
+        s_voice_context = s_face == FACE_CALENDAR ? "calendar" : s_face == FACE_TASKS ? "tasks" : NULL;
+        s_cl_listen_hint = s_face == FACE_CALENDAR ? "Say what to add to the calendar"
+                         : s_face == FACE_TASKS    ? "Say the task to add"
+                         : "Listening...  press again to send";
+        if (mic_start(MIC_MAX_SECS) == ESP_OK) { ESP_LOGI(TAG, "BOOT: listening (%s)", s_voice_context ? s_voice_context : "ask"); claude_set_state(CL_LISTENING, NULL); }
+        else claude_set_state(CL_ANSWER, "Microphone isn't available.");
+        break;
+    case CL_LISTENING:
+        claude_listen_done();
+        break;
+    case CL_WORKING:
+        break;
+    default:
         ESP_LOGI(TAG, "BOOT: close");
         claude_set_state(CL_IDLE, NULL);
+        break;
     }
+    bsp_display_unlock();
+}
+
+/* Long press: the quick menu (Date / Weather / Email / Calendar). */
+static void claude_long_press(void)
+{
+    if (!bsp_display_lock(200)) return;
+    if (!s_screen_on) screen_set(true);
+    if (s_cl_state == CL_IDLE) { ESP_LOGI(TAG, "BOOT: menu"); claude_set_state(CL_MENU, NULL); }
     bsp_display_unlock();
 }
 
@@ -2010,15 +2274,18 @@ static void boot_button_task(void *arg)
     };
     gpio_config(&io);
     int stable = 1, last = 1;
-    int64_t changed_us = 0;
+    int64_t changed_us = 0, press_us = 0;
+    bool long_fired = false;
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(20));
         int v = gpio_get_level(BOOT_BUTTON_GPIO);
         int64_t now = esp_timer_get_time();
         if (v != last) { last = v; changed_us = now; continue; }
+        if (stable == 0 && !long_fired && now - press_us > 600000) { long_fired = true; claude_long_press(); }
         if (v != stable && now - changed_us > 40000) {      /* 40 ms debounce */
             stable = v;
-            if (stable == 0) claude_button();                /* active low */
+            if (stable == 0) { press_us = now; long_fired = false; }   /* active low: pressed */
+            else if (!long_fired) claude_button();                       /* released after a short press */
         }
     }
 }
@@ -2051,6 +2318,34 @@ static void claude_build(lv_obj_t *scr)
     lv_obj_remove_flag(s_cl_layer, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(s_cl_layer, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_event_cb(s_cl_layer, claude_layer_tap_cb, LV_EVENT_CLICKED, NULL);
+
+    s_cl_blob = lv_obj_create(s_cl_layer);                  /* pulses with your voice while listening */
+    lv_obj_set_size(s_cl_blob, BLOB_MIN, BLOB_MIN);
+    lv_obj_set_style_radius(s_cl_blob, BLOB_MIN / 2, 0);
+    lv_obj_set_style_bg_color(s_cl_blob, lv_color_hex(CLAUDE_ORANGE), 0);
+    lv_obj_set_style_bg_opa(s_cl_blob, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(s_cl_blob, 0, 0);
+    lv_obj_set_style_shadow_width(s_cl_blob, 40, 0);
+    lv_obj_set_style_shadow_color(s_cl_blob, lv_color_hex(CLAUDE_ORANGE), 0);
+    lv_obj_set_style_shadow_opa(s_cl_blob, LV_OPA_50, 0);
+    lv_obj_remove_flag(s_cl_blob, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(s_cl_blob, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_center(s_cl_blob);
+
+    s_cl_heard = lv_label_create(s_cl_layer);
+    lv_obj_set_width(s_cl_heard, SCREEN_W - 60);
+    lv_label_set_long_mode(s_cl_heard, LV_LABEL_LONG_DOT);
+    lv_obj_set_style_text_font(s_cl_heard, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(s_cl_heard, lv_color_hex(0xFFE0D2), 0);
+    lv_obj_set_style_text_align(s_cl_heard, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_add_flag(s_cl_heard, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_align(s_cl_heard, LV_ALIGN_TOP_MID, 0, 30);
+
+    s_cl_hint = lv_label_create(s_cl_layer);
+    lv_obj_set_style_text_font(s_cl_hint, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(s_cl_hint, lv_color_hex(0xFFCCBC), 0);
+    lv_obj_add_flag(s_cl_hint, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_align(s_cl_hint, LV_ALIGN_BOTTOM_MID, 0, -56);
 
     s_cl_ring = lv_obj_create(s_cl_layer);
     lv_obj_set_size(s_cl_ring, SCREEN_W, SCREEN_H);
@@ -2159,7 +2454,7 @@ static void build_ui(void)
     lv_label_set_text(s_batt_label, "Battery --");
     lv_obj_align(s_batt_label, LV_ALIGN_CENTER, 0, 125);
 
-    s_clock_timer = lv_timer_create(clock_tick, 250, NULL);
+    s_clock_timer = lv_timer_create(clock_tick, 500, NULL);
     sw_build(scr);
     cal_build(scr);
     tasks_build(scr);
@@ -2170,28 +2465,71 @@ static void build_ui(void)
     face_reset_instant();
 }
 
+/* Persistent battery log in flash (slot "battlog"): one line every 10 min and on every
+   charge-state or screen change:  B <unix time> <mV> <pct> <C|D|S> <screen 0|1> <wifi 0|1>
+   Survives power-off; dump with BATTLOG, wipe with BATTLOG CLEAR, analyse with tools/battlog.py. */
+static void battlog_append(int mv, int pct, char st)
+{
+    static char *buf;
+    if (!buf) buf = heap_caps_malloc(CALSTORE_MAX_TEXT + 1, MALLOC_CAP_SPIRAM);
+    if (!buf) return;
+    size_t len = calstore_read(BATTLOG_KEY, buf, CALSTORE_MAX_TEXT + 1);
+    if (len > CALSTORE_MAX_TEXT - 1024) {                 /* nearly full: drop the oldest half */
+        char *cut = strchr(buf + len / 2, '\n');
+        if (cut) { cut++; len -= (size_t)(cut - buf); memmove(buf, cut, len); buf[len] = '\0'; }
+    }
+    len += snprintf(buf + len, CALSTORE_MAX_TEXT - len, "B %lld %d %d %c %d %d\n",
+                    (long long)time(NULL), mv, pct, st, s_screen_on ? 1 : 0, net_connected() ? 1 : 0);
+    calstore_write(BATTLOG_KEY, buf, len);
+}
+
+static void pmu_key_task(void *arg)
+{
+    (void)arg;
+    vTaskDelay(pdMS_TO_TICKS(3000));          /* ignore the press that powered us on */
+    pmu_wr(AXP_INTSTS2, AXP_KEY_SHORT_BIT);
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+        uint8_t st = 0;
+        if (pmu_rd(AXP_INTSTS2, &st) != ESP_OK) continue;
+        if (st & AXP_KEY_SHORT_BIT) {
+            pmu_wr(AXP_INTSTS2, AXP_KEY_SHORT_BIT);
+            pmu_power_off();
+        }
+    }
+}
+
 static void battery_task(void *arg)
 {
     (void)arg;
     if (pmu_init() != ESP_OK) { ESP_LOGW(TAG, "PMU init failed"); vTaskDelete(NULL); return; }
+    pmu_key_setup();
+    xTaskCreateWithCaps(pmu_key_task, "pmu_key", 3072, NULL, 3, NULL, MALLOC_CAP_SPIRAM);
     char last_state = 0;
-    int64_t last_log_us = -600LL * 1000000;
+    bool last_screen = s_screen_on;
+    int64_t last_log_us = -600LL * 1000000, last_flash_us = -600LL * 1000000;
     for (;;) {
         int mv, pct; char st;
         if (pmu_read(&mv, &pct, &st)) {
             s_batt_pct = pct; s_batt_mv = mv; s_batt_state = st;   /* read by clock_tick on the CLOCK face */
             int64_t now = esp_timer_get_time();
+            bool changed = false;
             if (st != last_state) {
                 evlog_add('P', st, pct);
                 ESP_LOGI(TAG, "Battery %d%% %d mV, %s", pct, mv, st == 'C' ? "charging" : st == 'D' ? "discharging" : "standby");
-                last_state = st;
+                last_state = st; changed = true;
             }
+            if (s_screen_on != last_screen) { last_screen = s_screen_on; changed = true; }
             if (now - last_log_us >= 300LL * 1000000) {
                 evlog_add('V', pct, mv / 10);
                 last_log_us = now;
             }
+            if (changed || now - last_flash_us >= 600LL * 1000000) {
+                battlog_append(mv, pct, st);
+                last_flash_us = now;
+            }
         }
-        vTaskDelay(pdMS_TO_TICKS(3000));
+        vTaskDelay(pdMS_TO_TICKS(s_screen_on ? 3000 : 30000));
     }
 }
 
@@ -2209,6 +2547,7 @@ void app_main(void)
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
     bsp_display_start();
     calstore_init();
+    mic_init();
     clock_setup();
 
     bsp_display_lock(0);
@@ -2220,5 +2559,6 @@ void app_main(void)
     xTaskCreateWithCaps(imu_task, "imu", 4096, NULL, 4, &s_imu_task, MALLOC_CAP_SPIRAM);
     xTaskCreateWithCaps(battery_task, "battery", 3072, NULL, 2, NULL, MALLOC_CAP_SPIRAM);
     xTaskCreateWithCaps(boot_button_task, "boot_btn", 3072, NULL, 3, NULL, MALLOC_CAP_SPIRAM);
+    bsp_display_brightness_set(BRIGHTNESS_PCT);
     ESP_LOGI(TAG, "Hello Luke clock running");
 }

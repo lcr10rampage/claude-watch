@@ -49,7 +49,23 @@ What it does today:
   certificate bundle; mbedTLS buffers live in PSRAM (`sdkconfig.defaults`).
 - **Sleep mode**: when the screen is off the CPU drops to 80 MHz and light-sleeps
   between events, LVGL timers pause, touch polls slower, the IMU task is
-  suspended. Light sleep is automatically disabled while USB is connected.
+  suspended, and **Wi-Fi is stopped** (restarted on wake, ~1.5 s). While awake
+  Wi-Fi uses modem sleep except during a request. Brightness is 70 %. The
+  screen does not time out on its own (an auto-off exists, `AUTOOFF <s>` over
+  serial, but it is disabled: it blanked answers as they arrived).
+- **Power key**: a short press powers the watch off (firmware tells the AXP2101),
+  holding it 1 s powers it on; the hardware 4 s hold still works as a fallback.
+- **Voice (BOOT button)**: press to listen (orange ring, centre circle pulses with
+  your voice), press again to send, or it stops at 15 s. The clip (16 kHz mono
+  from the ES7210 mics, `main/mic.c`) is POSTed to the Pi's `/ask-voice`; the
+  ring pulses while Whisper and Claude work, then the orange answer box shows
+  the reply. "Say that again?" drops straight back into listening. On the
+  **calendar face** BOOT adds what you say to Google Calendar (and slots it into
+  the stored week); on the **tasks face** it adds a task. Long-press BOOT for the
+  old quick menu (Date / Weather / Email / Calendar).
+- **Battery log**: a line every 10 min in flash (`BATTLOG`, `tools/battlog.py`
+  reports mV/h by screen and Wi-Fi state). The PMU's percent is unreliable;
+  trust the voltage.
 - **Battery**: read from the AXP2101 (`BATT` over serial), logged to the event
   ring every 5 minutes.
 - Time comes from the on-board PCF85063 RTC, seeded from the build timestamp
@@ -113,7 +129,10 @@ Stop any serial listener before flashing; the port cannot be shared.
 `SWIPE LEFT|RIGHT` (stopwatch in/out), `DTAP` (toggle screen), `BOOT` (Claude
 menu), `ASK <question>`, `WIFI` (ip, rssi, server reachable), `HEAP`, `BATT`,
 `SCAN` (list visible networks), `NEXTNET` (drop to the next known network),
-`SWIPE DOWN|UP` (calendar in/out, tasks in/out), `CALOPEN n` (open week n), slot upload
+`SWIPE DOWN|UP` (calendar in/out, tasks in/out), `CALOPEN n` (open week n),
+`MICREC <s>` / `MICSTOP` / `MICLEVEL` / `MICDUMP` (`tools/mic_dump.py` saves a WAV),
+`VOICEASK` (send the last clip), `AUTOOFF <s>`, `RADIO ON|OFF`, `POWEROFF`,
+`BATTLOG [CLEAR]`, slot upload
 `CALCLEAR`, `CALBEGIN YYYY-MM-DD`, `CALADD <line>`, `CALEND`, `CALLIST`,
 `DUMP` (on-device event log), `LOG ON|OFF` (verbose touch/accelerometer logging).
 

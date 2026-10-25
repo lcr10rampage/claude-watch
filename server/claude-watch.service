@@ -14,7 +14,7 @@ User=lcr10rampage
 WorkingDirectory=/home/lcr10rampage/claude-watch/server
 EnvironmentFile=/home/lcr10rampage/claude-watch/server/.env
 Environment=PATH=/home/lcr10rampage/.local/bin:/usr/local/bin:/usr/bin:/bin
-ExecStart=/usr/bin/python3 /home/lcr10rampage/claude-watch/server/server.py
+ExecStart=/home/lcr10rampage/stt-env/bin/python /home/lcr10rampage/claude-watch/server/server.py
 Restart=always
 RestartSec=5
 

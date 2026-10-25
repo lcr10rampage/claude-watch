@@ -9,7 +9,7 @@ list(SORT PIC_FILES)
 list(LENGTH PIC_FILES PIC_COUNT)
 
 idf_component_register(
-    SRCS main.c net.c calstore.c
+    SRCS main.c net.c calstore.c mic.c
     INCLUDE_DIRS .
     EMBED_FILES ${PIC_FILES})
 
